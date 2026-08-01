@@ -21,6 +21,8 @@ Windows 原生调试器：单文件 C++17 实现，x64 Release 仅约 500KB，�
   每次调用独立干净、可并发。
 - **三类断点 + API 断点**：软件断点、硬件断点（DR0~DR3）、内存断点（guard-page）、
   `dll!api` 系统 API 断点（自动补 `.dll`）。
+- **源码/PDB 校验**：`info source` 校验当前源文件与 PDB 记录的校验和是否一致，
+  `set source-checksum on` 后 `list` / `break <file.c:NN>` 在失配时告警（默认 off）。
 - **深度符号**：dbghelp 加载 PDB；`info locals` / `info args` 枚举局部变量与参数，
   `bt` 基于 `StackWalk64`（优化构建下依然稳定）。
 - **异常拦截**：除零 `0xc0000094`、访问违例 `0xc0000005` 等精确停住并报告。
@@ -93,8 +95,9 @@ stepi(si) / nexti(ni) / finish
 break(b,br) / hbreak(hb) / mbreak(mb) / watch / rwatch / awatch
 condition / ignore / delete / disable / enable
 registers(regs) / set / x / dump / disas(u) / bt / search / strings / list
-info break / threads / modules / proc / files / locals / args / events / registers
+info break / threads / modules / proc / files / locals / args / events / source / registers
 set engine <aslr|console|passexc> on/off
+set source-checksum on|off / show source-checksum
 echo / help / quit(q)
 ```
 
@@ -117,6 +120,7 @@ tests\run_tests.cmd        :: 全绿返回 0，可接入 CI
 | `handleover.md` | 架构实现、TitanEngine API 事实、命令集、AI 接口 |
 | `handover2.md` | 断点现场 / 栈回溯 / 变量 / 源码 / 条件断点 |
 | `handover3.md` | GDB 兼容性修复（finish / x-i / thread / info files 等） |
+| `handover4.md` | 源码/PDB 校验（info source / source-checksum，算法映射实测） |
 | `TestGuid.md` | 测试程序与测试逻辑设计指导 |
 | `ISSUES.md` | 已知问题清单与修复记录 |
 | `tests/README.md` | 测试套件说明 |

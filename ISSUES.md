@@ -157,3 +157,15 @@
 > C2（`hbreak` 符号解析）、C3（`x/i`）、`--command` 文件语义、`thread <内部编号>`、
 > `disable`/`enable` 无参、`info files`（符号文件/入口点/加载文件）。
 > 详见 `handover3.md`。
+
+## F. 源码/PDB 校验（第四阶段，handover4.md）
+
+- `SymGetSourceFileChecksumW` 的 `pCheckSumType` **无公开枚举**；本机实测映射
+  1=MD5(16B)、2=SHA1(20B)、3=SHA256(32B)，MSVC 默认 `/ZH:SHA_256`(type=3)。
+  未知类型降级为 `unknown-algorithm(N)` 报告。
+- 该 API 的 `Base` 必须传模块基址（传 0 返回 err 126）。
+- BCrypt `BCryptFinishHash` 的输出缓冲需等于摘要长度（传 64 返回 `0xc000000d`）。
+- `info source` 始终执行校验（显式诊断）；`list` / `break <file.c:NN>` 仅在
+  `set source-checksum on` 时校验并告警（默认 off，避免干扰）。
+- `list` 的 JSON 输出已从数组改为 `{"lines":[...]}`（新增可选 `"checksum"` 字段），
+  schema 变化请以 4.14 用例为准。

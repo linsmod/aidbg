@@ -39,7 +39,7 @@ BUILD_CMD = os.path.join(HERE, "build.cmd")
 PYTHON = sys.executable
 
 TARGETS = ["test_basic", "test_memory", "test_exception", "test_threads",
-           "test_symbols", "test_attach"]
+           "test_symbols", "test_attach", "test_checksum"]
 
 
 # ------------------------------------------------------------------- helpers ---
@@ -260,6 +260,57 @@ def case_search_strings():
     return results
 
 
+def case_source_checksum():
+    """Case 4.14 - source-file / PDB checksum verification.
+
+    Builds test_checksum.exe, verifies `info source` reports ok while the
+    source matches, tampers the .c file so the PDB checksum no longer matches,
+    then asserts `info source` -> mismatch and that `list` warns (only while
+    `set source-checksum on`).  The .c file is restored in `finally`.
+    """
+    results = []
+    src = os.path.join(SRC_DIR, "test_checksum.c")
+    exe = os.path.join(ROOT, "test_checksum.exe")
+    with open(src, "rb") as f:
+        original = f.read()
+
+    def run_script(lines):
+        script = os.path.join(HERE, "_case_4_14_tmp.txt")
+        with open(script, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        rc, out = aidbg_run(script)
+        os.unlink(script)
+        return out
+
+    try:
+        base_cmds = ["file %s" % exe, "start"]
+        out = run_script(base_cmds + ["info source", "quit"])
+        results.append(("info source ok while source matches",
+                        "Checksum: ok" in out, out))
+
+        # tamper in binary so the PDB checksum (taken at build time over the
+        # original bytes) no longer matches; restore must also be byte-exact.
+        with open(src, "wb") as f:
+            f.write(original + b"\n// TAMPERED for checksum test\n")
+
+        out = run_script(base_cmds + ["info source", "quit"])
+        results.append(("info source mismatch after tamper",
+                        "Checksum: mismatch" in out, out))
+
+        out = run_script(["file %s" % exe, "set source-checksum on", "start",
+                          "list", "quit"])
+        results.append(("list warns on mismatch (toggle on)",
+                        "!! Checksum mismatch" in out, out))
+
+        out = run_script(base_cmds + ["list", "quit"])
+        results.append(("list silent when toggle off",
+                        "!! Checksum mismatch" not in out, out))
+    finally:
+        with open(src, "wb") as f:
+            f.write(original)
+    return results
+
+
 # ------------------------------------------------------------- case table ---
 
 CASES = [
@@ -366,6 +417,13 @@ CASES = [
         "script": "case_4_13_info_files.txt",
         "expect": ["Symbols from \"test_basic.exe\"", "Local exec file:", "Entry point: 0x"],
     },
+    {
+        "id": "4.14",
+        "name": "source/PDB checksum verification",
+        "script": None,
+        "expect": None,
+        "dynamic": "checksum",
+    },
 ]
 
 
@@ -402,6 +460,8 @@ def main():
             continue
         if case.get("dynamic") == "search":
             results = case_search_strings()
+        elif case.get("dynamic") == "checksum":
+            results = case_source_checksum()
         else:
             results = run_case(case)
         all_cases.append((case["id"], case["name"], results))
@@ -410,7 +470,6 @@ def main():
         all_cases.append(("4.7b", "thread switching + bt", case_thread_switch()))
     if args.case in (None, "4.8"):
         all_cases.append(("4.8", "attach / detach", case_attach_detach()))
-
     # report
     print("\n%-6s  %-40s  %-6s  %s" % ("CASE", "NAME", "STATUS", "DETAIL"))
     print("-" * 100)

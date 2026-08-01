@@ -43,6 +43,8 @@
 
 #include <dbghelp.h>
 #pragma comment(lib, "dbghelp.lib")
+#include <bcrypt.h>
+#pragma comment(lib, "bcrypt.lib")
 
 #include <string>
 #include <vector>
@@ -241,6 +243,11 @@ static std::vector<ModInfo> g_mods;
 static bool g_sym_active = false;
 static HANDLE g_sym_proc = NULL;
 static std::set<ULONG_PTR> g_sym_loaded;   // module bases already handed to dbghelp
+
+// source-file / PDB checksum verification (optional, default off)
+static bool g_source_checksum = false;
+struct CsCache { std::string status; DWORD type; FILETIME mtime; ULONGLONG size; };
+static std::map<std::string, CsCache> g_cs_cache;   // per-file-path cached result
 
 static void sym_begin(PROCESS_INFORMATION* pi);
 static void sym_end();
@@ -1057,6 +1064,101 @@ static bool resolve_line(const std::string& file, long line, ULONG_PTR& out)
     if ((long)li2.LineNumber != line) return false;
     out = (ULONG_PTR)li.Address;
     return out != 0;
+}
+
+// ----------------------------------------------------- source/PDB checksum ---
+// Optional source-file verification (VS-style): compare the checksum recorded in
+// the PDB with a local hash of the source file. `SymGetSourceFileChecksumW` returns
+// the algorithm id in pCheckSumType (undocumented; empirically mapped on MSVC:
+// 1=MD5(16B), 2=SHA1(20B), 3=SHA256(32B)). Local hashing uses BCrypt. Enabled via
+// `set source-checksum on` (default off). Results are cached per file path and
+// invalidated when size/mtime change.
+
+static const char* cs_alg_name(DWORD type)
+{
+    switch (type) {
+        case 1: return "MD5";
+        case 2: return "SHA1";
+        case 3: return "SHA256";
+        default: return "unknown";
+    }
+}
+
+// returns false when the algorithm is unsupported or the file cannot be read
+static bool local_file_checksum(const std::wstring& path, DWORD type, std::vector<BYTE>& out)
+{
+    DWORD len = 0;
+    LPCWSTR alg = NULL;
+    switch (type) {
+        case 1: len = 16; alg = BCRYPT_MD5_ALGORITHM; break;
+        case 2: len = 20; alg = BCRYPT_SHA1_ALGORITHM; break;
+        case 3: len = 32; alg = BCRYPT_SHA256_ALGORITHM; break;
+        default: return false;
+    }
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    BCRYPT_ALG_HANDLE ha = NULL;
+    BCRYPT_HASH_HANDLE hh = NULL;
+    bool ok = BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&ha, alg, NULL, 0));
+    if (ok) ok = BCRYPT_SUCCESS(BCryptCreateHash(ha, &hh, NULL, 0, NULL, 0, 0));
+    BYTE buf[65536];
+    DWORD rd = 0;
+    while (ok && ReadFile(h, buf, sizeof(buf), &rd, NULL) && rd)
+        if (!BCRYPT_SUCCESS(BCryptHashData(hh, buf, rd, 0))) { ok = false; break; }
+    if (ok) {
+        out.resize(len);
+        // BCryptFinishHash wants the exact digest length in cbOutput (64 is rejected)
+        ok = BCRYPT_SUCCESS(BCryptFinishHash(hh, out.data(), len, 0));
+    }
+    if (hh) BCryptDestroyHash(hh);
+    if (ha) BCryptCloseAlgorithmProvider(ha, 0);
+    CloseHandle(h);
+    return ok && out.size() == len;
+}
+
+// verify a source file against the PDB checksum; result is cached
+static std::string source_checksum_verify(HANDLE hProc, ULONG64 base, const std::string& file,
+                                         DWORD* out_type = NULL)
+{
+    if (!hProc || !g_sym_active || file.empty()) return "no-symbols";
+    int n = MultiByteToWideChar(CP_UTF8, 0, file.c_str(), -1, NULL, 0);
+    if (n <= 1) return "bad-path";
+    std::wstring wf(n - 1, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, file.c_str(), -1, &wf[0], n);
+
+    WIN32_FILE_ATTRIBUTE_DATA wfad;
+    if (!GetFileAttributesExW(wf.c_str(), GetFileExInfoStandard, &wfad))
+        return "file-not-found";
+    ULONGLONG size = ((ULONGLONG)wfad.nFileSizeHigh << 32) | wfad.nFileSizeLow;
+
+    auto it = g_cs_cache.find(file);
+    if (it != g_cs_cache.end() && it->second.size == size &&
+        CompareFileTime(&it->second.mtime, &wfad.ftLastWriteTime) == 0) {
+        if (out_type) *out_type = it->second.type;
+        return it->second.status;
+    }
+
+    DWORD type = 0, need = 0;
+    if (!SymGetSourceFileChecksumW(hProc, base, wf.c_str(), &type, NULL, 0, &need) || !need)
+        return "no-checksum";
+    std::vector<BYTE> pdb(need);
+    if (!SymGetSourceFileChecksumW(hProc, base, wf.c_str(), &type, pdb.data(), need, &need))
+        return "pdb-error";
+
+    std::string status;
+    std::vector<BYTE> local;
+    if (local_file_checksum(wf, type, local)) {
+        status = (local.size() == pdb.size() && memcmp(local.data(), pdb.data(), local.size()) == 0)
+                 ? "ok" : "mismatch";
+    } else {
+        status = cs_alg_name(type)[0] == 'u'
+                 ? "unknown-algorithm(" + std::to_string(type) + ")" : "read-error";
+    }
+    CsCache c; c.status = status; c.type = type; c.mtime = wfad.ftLastWriteTime; c.size = size;
+    g_cs_cache[file] = c;
+    if (out_type) *out_type = type;
+    return status;
 }
 
 // ------------------------------------------------------------------- expr eval ---
@@ -1939,6 +2041,20 @@ static CmdResult cmd_break(const std::vector<std::string>& args)
                   + (b.pending ? ",\"pending\":true" : "") + "}}";
             cr.text = "Breakpoint " + std::to_string(b.id) + " at " + disp
                     + (b.pending ? " (pending: applied on run)" : "");
+            if (!b.pending && g_source_checksum) {
+                std::string srcfile = linefile.empty() ? current_source_file() : linefile;
+                if (!linefile.empty()) {
+                    // resolve the short name to the PDB-recorded full path
+                    IMAGEHLP_LINEW64 li2 = {};
+                    li2.SizeOfStruct = sizeof(li2);
+                    DWORD col2 = 0;
+                    if (SymGetLineFromAddrW64(g_sym_proc, (DWORD64)la, &col2, &li2))
+                        srcfile = utf8(li2.FileName);
+                }
+                ULONG64 base = SymGetModuleBase64(g_sym_proc, (DWORD64)la);
+                std::string status = source_checksum_verify(g_sym_proc, base, srcfile);
+                if (status != "ok") cr.text += "  [!! Checksum mismatch: " + srcfile + " (" + status + ")]";
+            }
             return cr;
         }
     }
@@ -2556,7 +2672,7 @@ static CmdResult list_file_lines(const std::string& file, long curline)
     long to = curline + 5;
     long ln = 0;
     std::ostringstream t, j;
-    j << "[";
+    j << "{\"lines\":[";
     bool first = true;
     std::string line;
     while (std::getline(f, line)) {
@@ -2569,7 +2685,7 @@ static CmdResult list_file_lines(const std::string& file, long curline)
           << "\",\"current\":" << (ln == curline ? "true" : "false") << "}";
         t << (ln == curline ? ">" : " ") << std::setw(5) << ln << " | " << line << "\n";
     }
-    j << "]";
+    j << "]}";
     if (first) return {false, "line " + std::to_string(curline) + " outside file"};
     CmdResult cr;
     cr.js = j.str();
@@ -2608,7 +2724,17 @@ static CmdResult cmd_list(const std::vector<std::string>& args)
     std::string file = utf8(li.FileName);
     long line = (long)li.LineNumber;
     if (!args.empty() && isdigit((unsigned char)args[0][0])) line = (long)strtol(args[0].c_str(), nullptr, 0);
-    return list_file_lines(file, line);
+    CmdResult cr = list_file_lines(file, line);
+    if (cr.ok && g_source_checksum) {
+        ULONG64 base = SymGetModuleBase64(g_sym_proc, (DWORD64)addr);
+        std::string status = source_checksum_verify(g_sym_proc, base, file);
+        if (status != "ok") {
+            cr.text += "!! Checksum mismatch: " + file + " (" + status + ")\n";
+            if (!cr.js.empty() && cr.js.front() == '{')
+                cr.js.insert(cr.js.size() - 1, ",\"checksum\":\"" + status + "\"");
+        }
+    }
+    return cr;
 }
 
 // -- search --
@@ -3010,6 +3136,56 @@ static CmdResult cmd_set_engine(const std::vector<std::string>& args)
     return cr;
 }
 
+// -- source checksum toggle / query --
+static CmdResult cmd_set_checksum(const std::vector<std::string>& args)
+{
+    if (args.empty()) return {false, "usage: set source-checksum on|off"};
+    bool on = args[0] == "on" || args[0] == "1" || args[0] == "true";
+    g_source_checksum = on;
+    CmdResult cr;
+    cr.js = std::string("{\"source-checksum\":") + (on ? "true" : "false") + "}";
+    cr.text = std::string("source-checksum = ") + (on ? "on" : "off");
+    return cr;
+}
+
+static CmdResult cmd_show_checksum()
+{
+    CmdResult cr;
+    cr.js = std::string("{\"source-checksum\":") + (g_source_checksum ? "true" : "false") + "}";
+    cr.text = std::string("source-checksum = ") + (g_source_checksum ? "on" : "off");
+    return cr;
+}
+
+// `info source`: current stop's source file + PDB checksum verification.
+// Always verifies (explicit diagnostic), regardless of the source-checksum toggle.
+static CmdResult cmd_info_source()
+{
+    if (!require_running()) return {false, "no active debug session"};
+    if (!g_sym_active || !g_sym_proc) return {false, "no symbols loaded"};
+    CONTEXT c;
+    if (!ctx_display(c)) return {false, "cannot read thread context"};
+    ULONG_PTR addr = target_is64() ? (ULONG_PTR)c.Rip : (ULONG_PTR)reg_get(UE_EIP);
+    if (!addr) return {false, "cannot determine stop location"};
+    IMAGEHLP_LINEW64 li = {};
+    li.SizeOfStruct = sizeof(li);
+    DWORD col = 0;
+    if (!SymGetLineFromAddrW64(g_sym_proc, addr, &col, &li))
+        return {false, "no line info at " + hex(addr)};
+    std::string file = utf8(li.FileName);
+    ULONG64 base = SymGetModuleBase64(g_sym_proc, addr);
+    DWORD type = 0;
+    std::string status = source_checksum_verify(g_sym_proc, base, file, &type);
+    std::string alg = (type && status != "no-checksum") ? cs_alg_name(type) : "-";
+    CmdResult cr;
+    cr.js = "{\"file\":\"" + js_str(file) + "\",\"checksum\":\"" + status
+          + "\",\"algorithm\":\"" + alg + "\",\"enabled\":" + (g_source_checksum ? "true" : "false") + "}";
+    cr.text = "Source file: " + file + "\n"
+            + "Checksum: " + status
+            + (alg != "-" ? " (" + alg + ")" : "")
+            + "  [source-checksum: " + (g_source_checksum ? "on" : "off") + "]";
+    return cr;
+}
+
 // -- help --
 static const char* HELP =
 "aidbg - GDB-style debugger on TitanEngine\n"
@@ -3041,6 +3217,7 @@ static const char* HELP =
 "  info break / modules / threads / proc / events / regs\n"
 "  info locals / info args     show local variables / function parameters (PDB)\n"
 "  info files / target         info files = symbol/exec files; target = modules\n"
+"  info source                 current source file + PDB checksum verification\n"
 "  delete / d <id...>          remove breakpoints (no ids = delete all)\n"
 "  disable/enable <id...>      toggle breakpoints\n"
 "  thread [id]                 show current thread / switch (id = internal # or tid)\n"
@@ -3059,6 +3236,8 @@ static const char* HELP =
 "  strings <addr> [size]       scan for ascii strings\n"
 "  echo <text>                 print text\n"
 "  set engine <var> on|off     aslr / console / passexc\n"
+"  set source-checksum on|off  verify source files against PDB checksums (default off)\n"
+"  show source-checksum        show the source-checksum toggle\n"
 "  help / quit / q\n";
 
 static CmdResult cmd_help()
@@ -3162,11 +3341,15 @@ static CmdResult execute(const std::string& line)
         if (tok.size() >= 2 && tok[1] == "args") {
             return cmd_set_args(std::vector<std::string>(tok.begin()+2, tok.end()));
         }
+        if (tok.size() >= 2 && tok[1] == "source-checksum") {
+            return cmd_set_checksum(std::vector<std::string>(tok.begin()+2, tok.end()));
+        }
         return cmd_set(std::vector<std::string>(tok.begin()+1, tok.end()));
     }
     if (cmd == "show") {
-        if (tok.size() < 2) return {false, "usage: show args"};
+        if (tok.size() < 2) return {false, "usage: show args|source-checksum"};
         if (tok[1] == "args") return cmd_show_args();
+        if (tok[1] == "source-checksum") return cmd_show_checksum();
         return {false, "unknown show topic: " + tok[1]};
     }
     if (cmd == "print" || cmd == "p") {
@@ -3225,6 +3408,7 @@ static CmdResult execute(const std::string& line)
         if (what == "threads") return cmd_info_threads();
         if (what == "proc") return cmd_info_proc();
         if (what == "events") return cmd_info_events();
+        if (what == "source") return cmd_info_source();
         if (what == "registers" || what == "regs" || what == "reg" || what == "r") return cmd_registers();
         return {false, "unknown info topic: " + what};
     }

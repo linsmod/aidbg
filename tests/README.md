@@ -70,6 +70,7 @@ cl /nologo /Zi /Od /Oy- /GS- /MTd /Fe:<target>.exe <target>.c /link /DEBUG:FULL 
 | 4.11c | `case_4_11c_line_oob.txt` | 超范围行号 | 报错 `No line 999 ...` |
 | 4.12 | `case_4_12_gdb_compat.txt` | GDB 兼容（finish/x-i/disable） | `main+0x21`、`MOV`、`disabled all breakpoints` |
 | 4.13 | `case_4_13_info_files.txt` | `info files`（符号/入口/加载文件） | `Symbols from ...`、`Entry point: 0x...` |
+| 4.14 | （运行器动态驱动） | 源码/PDB 校验（`info source`、list 警告） | 源未改动 `Checksum: ok`；篡改后 `mismatch` + `!! Checksum mismatch`（仅开关开启时） |
 
 > **断点编号**：`start` 的一次性入口断点占用 id 1（GDB 一致），因此 4.2/4.2b 的
 > `break func1` 为 id 2、4.9 的 `break add` 为 id 2，脚本与断言均已按此编号。
@@ -84,6 +85,9 @@ cl /nologo /Zi /Od /Oy- /GS- /MTd /Fe:<target>.exe <target>.c /link /DEBUG:FULL 
   `break tick_func` → `continue` → `bt` → `detach` → 确认目标仍存活。
 - **4.10b**：解析 `search` 返回的地址 → `strings <addr> 0x1000` → 确认含
   `Hello, aidbg!`。
+- **4.14**：对 `test_checksum.exe` 先 `info source` 断言 `ok`；二进制篡改源文件后断言
+  `mismatch`；`set source-checksum on` 下 `list` 输出 `!! Checksum mismatch`；
+  关闭时静默。`finally` 中按字节恢复源文件（避免文本模式改写行尾导致 PDB 校验失配）。
 
 ## 与 TestGuid.md 的差异说明（实现现实）
 

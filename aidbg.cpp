@@ -12,7 +12,8 @@
 //   aidbg.exe [--batch] [-ex "cmd" ...] [-x script] [--args prog arg ...]
 //
 // --json              machine-readable output: one JSON object per line
-// --command           run a single command, then exit (AI-friendly)
+// --command           GDB: a file path runs as a command file; else a single
+//                     command, then exit (AI-friendly)
 // --commands          run a script file, then exit
 // --batch / -batch    batch mode; exit nonzero if the inferior crashed or a
 //                     command errored (in batch, "run" runs to exit/crash
@@ -25,6 +26,12 @@
 //                     rest of the command line); a bare "run" uses those args
 // -q / --quiet        suppress the startup banner
 // <target>            convenience: same as "file <target>" then "run"
+//
+// GDB `start`: stops at the program's entry function (main/WinMain/...) using a
+// temporary (one-shot) breakpoint, resolving the symbol from the PDB once the
+// target is running. `run` keeps GDB batch semantics (continue to exit/crash).
+// `break <symbol>` / `break <line>` / `break file.c:line` resolve from the PDB
+// before `run` and are armed (pending) when the target starts.
 
 #include <windows.h>
 #include <stdio.h>
@@ -205,9 +212,13 @@ struct Bpx {
     SIZE_T memsize;
     bool enabled;
     std::string symbol;       // original location spec, for display (e.g. "boom")
+    std::string file;         // source file for line breakpoints (file.c:NN)
+    long line = 0;            // source line for line breakpoints
     ULONG_PTR hits = 0;       // how many times this breakpoint has fired
     int ignore = 0;           // ignore this many crossings before stopping
     std::string condition;    // stop only while this expression evaluates true
+    bool oneshot = false;     // temporary breakpoint (tbreak / `start`): removed after first hit
+    bool pending = false;     // symbol breakpoint set before run: applied on process start
 };
 static std::map<int,Bpx> g_bps;
 static std::mutex g_bp_mu;               // guards g_bps (REPL vs DebugLoop thread)
@@ -215,6 +226,7 @@ static int g_bp_next_id = 1;
 static int g_hit_bp_id = 0;              // breakpoint that triggered the current stop
 static ULONG_PTR g_hit_bp_hits = 0;      // its hit count when it fired
 static bool g_cond_failed = false;       // condition eval errored on the last hit
+static bool g_hit_bp_oneshot = false;    // the hit came from a temporary (start) breakpoint
 
 // current "display" thread: 0 = the debug-event thread (TitanEngine context)
 static DWORD g_ctx_tid = 0;
@@ -241,6 +253,10 @@ static CmdResult cmd_info_vars(bool args_only);
 static bool mem_read(ULONG_PTR addr, void* buf, SIZE_T n, SIZE_T* nr);
 static bool sym_lookup(const std::string& name, ULONG_PTR& out);
 static bool eval_cond(const std::string& expr, bool& out);
+static void apply_pending_bps();
+static std::string resolve_gdb(ULONG_PTR addr);
+static bool resolve_line(const std::string& file, long line, ULONG_PTR& out);
+static bool require_running();
 
 // ------------------------------------------------------------------- helpers ---
 
@@ -419,6 +435,7 @@ static bool bp_hit(ULONG_PTR addr, int kind)
             b->hits++;
             g_hit_bp_id = b->id;
             g_hit_bp_hits = b->hits;
+            g_hit_bp_oneshot = false;
             if (b->ignore > 0) { b->ignore--; g_hit_bp_id = 0; return false; }
             if (!b->condition.empty()) {
                 bool v = false;
@@ -427,6 +444,16 @@ static bool bp_hit(ULONG_PTR addr, int kind)
                 } else {
                     g_cond_failed = true;   // eval error: stop anyway (fail-safe)
                 }
+            }
+            // we are going to stop on this breakpoint
+            g_hit_bp_oneshot = b->oneshot;
+            if (b->oneshot) {
+                // GDB tbreak: remove after the first hit
+                if (b->kind == 0 && b->addr) DeleteBPX(b->addr);
+                else if (b->kind == 1) DeleteAPIBreakPoint(b->dll.c_str(), b->api.c_str(), UE_APISTART);
+                else if (b->kind == 2) DeleteHardwareBreakPoint(b->hwreg);
+                else if (b->kind == 3) RemoveMemoryBPX(b->addr, b->memsize);
+                g_bps.erase(b->id);
             }
         } else {
             g_hit_bp_id = 0;
@@ -576,6 +603,7 @@ static void reset_state()
     g_reason.clear(); g_exception_code = 0; g_exception_addr = 0;
     g_running = false;
     g_hit_bp_id = 0; g_hit_bp_hits = 0; g_cond_failed = false;
+    g_hit_bp_oneshot = false;
     g_ctx_tid = 0; g_ctx_valid = false;
     std::lock_guard<std::mutex> lk2(g_ev_mu);
     g_events.clear();
@@ -729,6 +757,7 @@ static std::string stop_json(const std::string& reason)
       << "\",\"registers\":" << regs_json();
     if (reason == "breakpoint" && g_hit_bp_id) {
         o << ",\"breakpoint_id\":" << g_hit_bp_id << ",\"hits\":" << g_hit_bp_hits;
+        if (g_hit_bp_oneshot) o << ",\"temporary\":true";
         if (g_cond_failed) o << ",\"condition_error\":true";
     }
     if (reason == "exception") {
@@ -745,8 +774,9 @@ static std::string stop_banner(const std::string& reason)
     auto* de = (DEBUG_EVENT*)GetDebugData();
     std::string thread = de ? std::to_string(de->dwThreadId) : "?";
     if (reason == "breakpoint" && g_hit_bp_id) {
-        // GDB-style: "Breakpoint 1, boom (symtest.c:2)"
-        o << "Breakpoint " << g_hit_bp_id << ", " << resolve(reg_get(UE_CIP))
+        // GDB-style: "Temporary breakpoint 1, main () at test_basic.c:29"
+        o << (g_hit_bp_oneshot ? "Temporary breakpoint " : "Breakpoint ") << g_hit_bp_id << ", "
+          << resolve_gdb(reg_get(UE_CIP))
           << (g_hit_bp_hits > 1 ? "  (hit " + std::to_string(g_hit_bp_hits) + ")" : "") << "\n";
         if (g_cond_failed) o << "  (warning: breakpoint condition failed to evaluate; stopped anyway)\n";
     }
@@ -766,6 +796,7 @@ static void emit_stop(const std::string& reason)
     printf("%s\n", out.c_str());
     fflush(stdout);
     g_cond_failed = false;
+    g_hit_bp_oneshot = false;
 }
 
 // ------------------------------------------------------------------ memory ---
@@ -874,6 +905,50 @@ static void sym_end()
     g_sym_loaded.clear();
 }
 
+// Load PDB symbols for a target file BEFORE the target process exists, so that
+// `break <symbol>` / `list <symbol>` work like GDB does (resolve from the symbol
+// file on disk). We use the current process as the dbghelp host; once the target
+// actually runs, sym_begin() re-initializes against the real process handle and
+// re-resolves addresses (handling ASLR by rebasing).
+static void sym_load_file(const std::string& path)
+{
+    if (path.empty()) return;
+    sym_end();
+    DWORD opts = SymGetOptions();
+    opts |= SYMOPT_UNDNAME | SYMOPT_LOAD_LINES;
+    opts &= ~SYMOPT_DEFERRED_LOADS;
+    SymSetOptions(opts);
+    HANDLE hHost = GetCurrentProcess();
+    if (!SymInitializeW(hHost, NULL, TRUE)) return;
+    g_sym_active = true;
+    g_sym_proc = hHost;
+    g_sym_loaded.clear();
+    int n = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, NULL, 0);
+    if (n > 1) {
+        std::wstring wp(n - 1, L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, &wp[0], n);
+        SymLoadModuleExW(hHost, NULL, wp.empty() ? NULL : wp.c_str(),
+                         NULL, 0, 0, NULL, 0);
+    }
+}
+
+// Resolve a symbol name to its address for display when no target is running.
+// sym_load_file() must have been called so sym_lookup() works.
+static bool sym_lookup_file(const std::string& name, ULONG_PTR& out)
+{
+    if (!g_sym_active || !g_sym_proc || name.empty()) return false;
+    int n = MultiByteToWideChar(CP_UTF8, 0, name.c_str(), -1, NULL, 0);
+    if (n <= 1) return false;
+    std::wstring wname(n - 1, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, name.c_str(), -1, &wname[0], n);
+    char buf[sizeof(SYMBOL_INFOW) + MAX_SYM_NAME * sizeof(WCHAR)];
+    PSYMBOL_INFOW si = (PSYMBOL_INFOW)buf;
+    si->SizeOfStruct = sizeof(SYMBOL_INFOW);
+    si->MaxNameLen = MAX_SYM_NAME;
+    if (SymFromNameW(g_sym_proc, wname.c_str(), si)) { out = (ULONG_PTR)si->Address; return true; }
+    return false;
+}
+
 // resolve an address to "func+0x12 (file.c:line)" using PDB symbols, or "" if none
 static std::string sym_resolve(ULONG_PTR addr)
 {
@@ -928,6 +1003,60 @@ static bool sym_lookup(const std::string& name, ULONG_PTR& out)
     SymEnumSymbolsW(g_sym_proc, GetDebuggedFileBaseAddress(), NULL, sym_lookup_all_cb, &ctx);
     if (ctx.hit) { out = ctx.hit; return true; }
     return false;
+}
+
+// ----------------------------------------------------------- line locations ---
+// GDB-style source-line breakpoints: `break 31` (current file) and
+// `break file.c:31`. dbghelp resolves file:line to an address via
+// SymGetLineFromNameW64; this works both before `run` (PDB preloaded with the
+// current process as host) and while the target runs (real process handle).
+
+// current source file of the stop location (or of `main` when nothing is stopped)
+static std::string current_source_file()
+{
+    if (!g_sym_active || !g_sym_proc) return "";
+    ULONG_PTR addr = 0;
+    if (require_running()) {
+        CONTEXT c;
+        if (ctx_display(c)) addr = target_is64() ? (ULONG_PTR)c.Rip : (ULONG_PTR)reg_get(UE_EIP);
+    }
+    if (!addr) sym_lookup("main", addr);   // fallback: the file containing main
+    if (!addr) return "";
+    IMAGEHLP_LINEW64 li = {};
+    li.SizeOfStruct = sizeof(li);
+    DWORD col = 0;
+    if (!SymGetLineFromAddrW64(g_sym_proc, (DWORD64)addr, &col, &li)) return "";
+    return utf8(li.FileName);
+}
+
+// resolve a source line to its address; `file` empty means the current file.
+// Cross-checks the returned line so an out-of-range request fails cleanly
+// (dbghelp silently clamps to the last line of the file).
+static bool resolve_line(const std::string& file, long line, ULONG_PTR& out)
+{
+    if (!g_sym_active || !g_sym_proc || line <= 0) return false;
+    std::string f = file;
+    if (f.empty()) f = current_source_file();
+    if (f.empty()) return false;
+    int n = MultiByteToWideChar(CP_UTF8, 0, f.c_str(), -1, NULL, 0);
+    if (n <= 1) return false;
+    std::wstring wf(n - 1, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, f.c_str(), -1, &wf[0], n);
+    IMAGEHLP_LINEW64 li = {};
+    li.SizeOfStruct = sizeof(li);
+    DWORD col = 0;
+    // SymGetLineFromNameW64(hProcess, ModuleName, FileName, Line, Column, Line):
+    // pass NULL module name so any loaded module is searched.
+    if (!SymGetLineFromNameW64(g_sym_proc, NULL, wf.c_str(), (DWORD)line, (PLONG)&col, &li)) return false;
+    // cross-check: SymGetLineFromNameW64 clamps an out-of-range request to the
+    // last line of the file; reject unless it really is the requested line
+    DWORD col2 = 0;
+    IMAGEHLP_LINEW64 li2 = {};
+    li2.SizeOfStruct = sizeof(li2);
+    if (!SymGetLineFromAddrW64(g_sym_proc, li.Address, &col2, &li2)) return false;
+    if ((long)li2.LineNumber != line) return false;
+    out = (ULONG_PTR)li.Address;
+    return out != 0;
 }
 
 // ------------------------------------------------------------------- expr eval ---
@@ -1170,6 +1299,36 @@ static std::string resolve(ULONG_PTR addr)
     }
     return "";
 }
+
+// GDB-style location for the stop banner: "func () at file.c:line" when symbols
+// are available, else fall back to resolve().  e.g.
+//   Temporary breakpoint 1, main () at test_basic.c:29
+static std::string resolve_gdb(ULONG_PTR addr)
+{
+    if (g_sym_active && g_sym_proc) {
+        char buf[sizeof(SYMBOL_INFOW) + MAX_SYM_NAME * sizeof(WCHAR)];
+        PSYMBOL_INFOW si = (PSYMBOL_INFOW)buf;
+        si->SizeOfStruct = sizeof(SYMBOL_INFOW);
+        si->MaxNameLen = MAX_SYM_NAME;
+        DWORD64 disp = 0;
+        if (SymFromAddrW(g_sym_proc, (DWORD64)addr, &disp, si)) {
+            IMAGEHLP_LINEW64 li = {};
+            li.SizeOfStruct = sizeof(IMAGEHLP_LINEW64);
+            DWORD col = 0;
+            std::ostringstream o;
+            o << utf8(si->Name) << " ()";
+            if (SymGetLineFromAddrW64(g_sym_proc, (DWORD64)addr, &col, &li)) {
+                std::string fn = utf8(li.FileName);
+                size_t slash = fn.find_last_of("\\/");
+                if (slash != std::string::npos) fn = fn.substr(slash + 1);
+                o << " at " << fn << ":" << li.LineNumber;
+            }
+            return o.str();
+        }
+    }
+    return resolve(addr);
+}
+
 
 // ------------------------------------------------------------------ disasm ---
 
@@ -1502,6 +1661,15 @@ static CmdResult cmd_run(const std::vector<std::string>& args, const std::string
     if (!g_init_ok) { if (g_loop_thread.joinable()) g_loop_thread.join(); return {false, "InitDebugW failed to create the target process"}; }
 
     std::string reason = wait_stop_consume();
+
+    // Load symbols for the live process and arm breakpoints that were set
+    // before `run` (GDB pending-breakpoint behaviour). Must happen before the
+    // batch skip-loop below, otherwise run() would continue straight to exit.
+    if (reason == "initial-break") {
+        sym_begin(TitanGetProcessInformation());
+        apply_pending_bps();
+    }
+
     if (reason == "initial-break" && g_batch && !gdb_start) {
         // GDB batch semantics: run() continues past the internal initial system
         // breakpoint and only stops at a real breakpoint, a crash, or process exit.
@@ -1523,7 +1691,54 @@ static CmdResult cmd_run(const std::vector<std::string>& args, const std::string
     if (!g_json && !g_silent) printf("Target started. pid=%lu base=%s\n",
         TitanGetProcessInformation()->dwProcessId,
         hex(GetDebuggedFileBaseAddress()).c_str());
-    sym_begin(TitanGetProcessInformation());
+
+    // GDB `start`: stop at the program's entry function (main/WinMain/...) via a
+    // one-shot breakpoint, instead of pausing at the internal system breakpoint.
+    // `start <func>` stops at the given function. Symbols are loaded by
+    // sym_begin(); we are stopped at the initial break here, so the PDB is
+    // available for sym_lookup().
+    if (gdb_start && reason == "initial-break") {
+        sym_begin(TitanGetProcessInformation());
+        apply_pending_bps();
+        ULONG_PTR entry = 0;
+        std::string want = args.size() > 1 ? args[1] : "";
+        if (!want.empty()) {
+            if (!sym_lookup(want, entry))
+                entry = 0;
+        } else {
+            const char* entry_names[] = { "main", "wmain", "WinMain", "wWinMain", "_main" };
+            for (auto n : entry_names) {
+                if (sym_lookup(n, entry)) break;
+            }
+        }
+        if (!entry) {
+            // GDB: "No symbol \"main\" in current context." Leave the target
+            // paused at the initial break so the user can continue manually.
+            emit_stop(reason);
+            return {false, "No symbol \"" + (want.empty() ? std::string("main") : want)
+                           + "\" in current context. (start: entry symbol not found)"};
+        }
+        if (!SetBPX(entry, UE_BREAKPOINT | UE_BREAKPOINT_TYPE_INT3, (void*)&cb_bpx))
+            return {false, "SetBPX failed for entry symbol"};
+        Bpx b; b.id = g_bp_next_id++; b.kind = 0; b.addr = entry; b.enabled = true;
+        b.symbol = want.empty() ? "main" : want; b.oneshot = true;
+        g_bps[b.id] = b;
+        {
+            std::lock_guard<std::mutex> lk(g_mu);
+            g_waiting = false;
+            g_cv.notify_all();
+        }
+        reason = wait_stop_consume();
+        if (reason == "exited" || reason == "ended") {
+            if (g_json) printf("{\"type\":\"exited\",\"code\":%ld}\n", GetExitCode());
+            else if (!g_silent) printf("Process exited with code %ld\n", GetExitCode());
+            fflush(stdout);
+            return {};
+        }
+        emit_stop(reason);
+        return {};
+    }
+
     emit_stop(reason);
     return {};
 }
@@ -1598,11 +1813,29 @@ static CmdResult cmd_continue()
 }
 
 // -- stepi / nexti / finish --
+// get the enclosing function symbol name for an address ("" if none)
+static std::string sym_func_name(ULONG_PTR addr)
+{
+    if (!g_sym_active || !g_sym_proc) return "";
+    char buf[sizeof(SYMBOL_INFOW) + MAX_SYM_NAME * sizeof(WCHAR)];
+    PSYMBOL_INFOW si = (PSYMBOL_INFOW)buf;
+    si->SizeOfStruct = sizeof(SYMBOL_INFOW);
+    si->MaxNameLen = MAX_SYM_NAME;
+    DWORD64 disp = 0;
+    if (!SymFromAddrW(g_sym_proc, (DWORD64)addr, &disp, si)) return "";
+    return utf8(si->Name);
+}
+
 static CmdResult cmd_step(const char* kind, int n)
 {
     if (!require_running()) return {false, "no active debug session"};
     if (!g_waiting) return {false, "target is not stopped"};
     if (n < 1) n = 1;
+    // GDB `finish`: run to the return point of the current function, then stop
+    // at the instruction AFTER the call in the caller. TitanEngine's StepOut
+    // stops on the callee's `ret`; step into it so we land in the caller.
+    std::string start_func;
+    if (strcmp(kind, "out") == 0) start_func = sym_func_name(reg_get(UE_CIP));
     std::string reason;
     for (int i = 0; i < n; i++) {
         ctx_reset();
@@ -1617,6 +1850,21 @@ static CmdResult cmd_step(const char* kind, int n)
         reason = wait_stop_consume();
         if (reason == "exited") break;
         if (reason == "ended") break;
+    }
+    // finish: if we are still inside the same function (on the ret), step once
+    // so rip points at the caller's next instruction (GDB semantics).
+    if (strcmp(kind, "out") == 0 && !start_func.empty()) {
+        for (int i = 0; i < 3 && reason != "exited" && reason != "ended"; i++) {
+            if (sym_func_name(reg_get(UE_CIP)) != start_func) break;
+            ctx_reset();
+            StepInto((void*)&cb_step);
+            {
+                std::lock_guard<std::mutex> lk(g_mu);
+                g_waiting = false;
+                g_cv.notify_all();
+            }
+            reason = wait_stop_consume();
+        }
     }
     if (reason == "exited") {
         if (g_json) printf("{\"type\":\"exited\",\"code\":%ld}\n", GetExitCode());
@@ -1645,28 +1893,91 @@ static CmdResult cmd_break(const std::vector<std::string>& args)
     std::string spec = args[0];
     // GDB syntax: break *ADDR means "break at this address" (not a dereference)
     if (!spec.empty() && spec[0] == '*') spec = spec.substr(1);
+
+    // GDB source-line breakpoints: `break 31` (current file) / `break file.c:31`
+    {
+        std::string linefile;
+        long lineno = 0;
+        bool isline = false;
+        // file.c:NN  -- split on the last ':' when the tail is all digits
+        size_t colon = spec.rfind(':');
+        if (colon != std::string::npos && colon + 1 < spec.size()) {
+            std::string tail = spec.substr(colon + 1);
+            if (!tail.empty() && tail.find_first_not_of("0123456789") == std::string::npos) {
+                linefile = spec.substr(0, colon);
+                lineno = strtol(tail.c_str(), nullptr, 0);
+                isline = true;
+            }
+        } else if (!spec.empty() && spec.find_first_not_of("0123456789") == std::string::npos) {
+            // bare number = line of the current source file (do NOT treat 0x.. as a line)
+            if (spec.find("0x") != 0 && spec.find("0X") != 0) {
+                lineno = strtol(spec.c_str(), nullptr, 0);
+                isline = true;
+            }
+        }
+        if (isline) {
+            ULONG_PTR la = 0;
+            if (!resolve_line(linefile, lineno, la)) {
+                std::string where = linefile.empty() ? current_source_file() : linefile;
+                return {false, "No line " + std::to_string(lineno) + (where.empty() ? "" : " in " + where)
+                               + " (no line info; ensure the target has PDB line numbers)"};
+            }
+            bool running = require_running();
+            if (running) {
+                bool r = SetBPX(la, UE_BREAKPOINT | UE_BREAKPOINT_TYPE_INT3, (void*)&cb_bpx);
+                if (!r) return {false, "SetBPX failed"};
+            }
+            Bpx b; b.id = g_bp_next_id++; b.kind = 0; b.addr = la; b.enabled = true;
+            b.symbol = spec; b.file = linefile; b.line = lineno;
+            b.pending = !running;
+            g_bps[b.id] = b;
+            std::string disp = linefile.empty() ? (current_source_file() + ":" + std::to_string(lineno))
+                                                : spec;
+            CmdResult cr; cr.ok = true;
+            cr.js = "{\"breakpoint\":{\"id\":" + std::to_string(b.id) + ",\"kind\":\"code\",\"address\":\"" + hex(la)
+                  + "\",\"file\":\"" + js_str(b.file) + "\",\"line\":" + std::to_string(lineno)
+                  + (b.pending ? ",\"pending\":true" : "") + "}}";
+            cr.text = "Breakpoint " + std::to_string(b.id) + " at " + disp
+                    + (b.pending ? " (pending: applied on run)" : "");
+            return cr;
+        }
+    }
+
     ULONG_PTR addr = 0;
     bool ok = parse_addr(spec, addr);
     if (ok && addr) {
-        bool r = SetBPX(addr, UE_BREAKPOINT | UE_BREAKPOINT_TYPE_INT3, (void*)&cb_bpx);
-        if (!r) return {false, "SetBPX failed"};
+        // SetBPX needs the debugged process; before `run` the breakpoint is pending
+        bool running = require_running();
+        if (running) {
+            bool r = SetBPX(addr, UE_BREAKPOINT | UE_BREAKPOINT_TYPE_INT3, (void*)&cb_bpx);
+            if (!r) return {false, "SetBPX failed"};
+        }
         Bpx b; b.id = g_bp_next_id++; b.kind = 0; b.addr = addr; b.enabled = true; b.symbol = spec;
+        b.pending = !running;
         g_bps[b.id] = b;
         CmdResult cr; cr.ok = true;
-        cr.js = "{\"breakpoint\":{\"id\":" + std::to_string(b.id) + ",\"kind\":\"code\",\"address\":\"" + hex(addr) + "\"}}";
-        cr.text = "Breakpoint " + std::to_string(b.id) + " at " + hex(addr);
+        cr.js = "{\"breakpoint\":{\"id\":" + std::to_string(b.id) + ",\"kind\":\"code\",\"address\":\"" + hex(addr) + "\""
+              + (b.pending ? ",\"pending\":true" : "") + "}}";
+        cr.text = "Breakpoint " + std::to_string(b.id) + " at " + hex(addr)
+                + (b.pending ? " (pending: applied on run)" : "");
         return cr;
     }
     // PDB symbol name: break boom  or  break symtest!boom
     if (sym_lookup(spec, addr) && addr) {
-        bool r = SetBPX(addr, UE_BREAKPOINT | UE_BREAKPOINT_TYPE_INT3, (void*)&cb_bpx);
-        if (!r) return {false, "SetBPX failed"};
+        bool running = require_running();
+        if (running) {
+            bool r = SetBPX(addr, UE_BREAKPOINT | UE_BREAKPOINT_TYPE_INT3, (void*)&cb_bpx);
+            if (!r) return {false, "SetBPX failed"};
+        }
         Bpx b; b.id = g_bp_next_id++; b.kind = 0; b.addr = addr; b.enabled = true; b.symbol = spec;
+        b.pending = !running;
         g_bps[b.id] = b;
         CmdResult cr; cr.ok = true;
         cr.js = "{\"breakpoint\":{\"id\":" + std::to_string(b.id) + ",\"kind\":\"code\",\"address\":\""
-              + hex(addr) + "\",\"symbol\":\"" + js_str(spec) + "\"}}";
-        cr.text = "Breakpoint " + std::to_string(b.id) + " at " + spec + " (" + hex(addr) + ")";
+              + hex(addr) + "\",\"symbol\":\"" + js_str(spec) + "\""
+              + (b.pending ? ",\"pending\":true" : "") + "}}";
+        cr.text = "Breakpoint " + std::to_string(b.id) + " at " + spec + " (" + hex(addr) + ")"
+                + (b.pending ? " (pending: applied on run)" : "");
         return cr;
     }
     // API breakpoint: module!api
@@ -1679,7 +1990,7 @@ static CmdResult cmd_break(const std::vector<std::string>& args)
         std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
         if (lower.size() < 4 || lower.substr(lower.size() - 4) != ".dll") dllname += ".dll";
         bool r = SetAPIBreakPoint(dllname.c_str(), api.c_str(), UE_BREAKPOINT | UE_BREAKPOINT_TYPE_INT3,
-                                  UE_APISTART, (void*)&cb_bpx);
+                                   UE_APISTART, (void*)&cb_bpx);
         if (!r) return {false, "SetAPIBreakPoint failed"};
         Bpx b; b.id = g_bp_next_id++; b.kind = 1; b.dll = dllname; b.api = api; b.enabled = true; b.addr = 0; b.symbol = spec;
         g_bps[b.id] = b;
@@ -1689,6 +2000,27 @@ static CmdResult cmd_break(const std::vector<std::string>& args)
         return cr;
     }
     return {false, "cannot parse breakpoint location: " + spec};
+}
+
+// Called from cmd_run/start/attach after symbols are loaded for the live
+// process: resolve and arm any breakpoints that were set before `run` (GDB
+// "pending breakpoint" behaviour). Only software breakpoints can be pending.
+static void apply_pending_bps()
+{
+    std::lock_guard<std::mutex> lk(g_bp_mu);
+    for (auto& kv : g_bps) {
+        Bpx& b = kv.second;
+        if (!b.pending || !b.enabled || b.kind != 0) continue;
+        ULONG_PTR addr = 0;
+        bool ok = false;
+        if (!b.file.empty() || b.line) ok = resolve_line(b.file, b.line, addr);
+        else if (!b.symbol.empty() && sym_lookup(b.symbol, addr)) ok = true;
+        else if (b.addr) { addr = b.addr; ok = true; }
+        if (!ok || !addr) continue;
+        if (!SetBPX(addr, UE_BREAKPOINT | UE_BREAKPOINT_TYPE_INT3, (void*)&cb_bpx)) continue;
+        b.addr = addr;
+        b.pending = false;
+    }
 }
 
 static std::string bp_list_json()
@@ -1701,13 +2033,18 @@ static std::string bp_list_json()
         if (!first) o << ","; first = false;
         Bpx& b = kv.second;
         o << "{\"id\":" << b.id << ",\"kind\":";
-        if (b.kind == 0) o << "\"code\",\"address\":\"" << hex(b.addr) << "\"";
+        if (b.kind == 0) {
+            o << "\"code\",\"address\":\"" << hex(b.addr) << "\"";
+            if (!b.file.empty() || b.line)
+                o << ",\"file\":\"" << js_str(b.file) << "\",\"line\":" << b.line;
+        }
         else if (b.kind == 1) o << "\"api\",\"dll\":\"" << js_str(b.dll) << "\",\"api\":\"" << js_str(b.api) << "\"";
         else if (b.kind == 2) o << "\"hardware\",\"address\":\"" << hex(b.addr) << "\"";
         else o << "\"memory\",\"address\":\"" << hex(b.addr) << "\",\"size\":" << b.memsize;
         o << ",\"enabled\":" << (b.enabled ? "true" : "false")
           << ",\"hits\":" << b.hits
-          << ",\"ignore\":" << b.ignore;
+          << ",\"ignore\":" << b.ignore
+          << ",\"pending\":" << (b.pending ? "true" : "false");
         if (!b.condition.empty()) o << ",\"condition\":\"" << js_str(b.condition) << "\"";
         o << "}";
     }
@@ -1728,7 +2065,14 @@ static std::string bp_list_text()
         std::string disp = "keep";
         std::string what;
         if (b.kind == 0) {
-            what = b.symbol.empty() ? hex(b.addr) : (b.symbol + " (" + hex(b.addr) + ")");
+            if (!b.file.empty() || b.line) {
+                std::string file = b.file.empty() ? "<current>" : b.file;
+                size_t slash = file.find_last_of("\\/");
+                if (slash != std::string::npos) file = file.substr(slash + 1);
+                what = file + ":" + std::to_string(b.line) + " (" + hex(b.addr) + ")";
+            } else {
+                what = b.symbol.empty() ? hex(b.addr) : (b.symbol + " (" + hex(b.addr) + ")");
+            }
             line << buf << " breakpoint " << disp << " " << (b.enabled ? "y" : "n") << " " << what;
         } else if (b.kind == 1) {
             what = b.dll + "!" + b.api;
@@ -1741,6 +2085,7 @@ static std::string bp_list_text()
             line << buf << " mem/watch   " << disp << " " << (b.enabled ? "y" : "n") << " " << what;
         }
         o << line.str() << "\n";
+        if (b.pending) o << "    pending (not yet applied; will arm on run)\n";
         if (b.hits) o << "    breakpoint already hit " << b.hits << " time" << (b.hits == 1 ? "" : "s") << "\n";
         if (b.ignore) o << "    ignore next " << b.ignore << " hits\n";
         if (!b.condition.empty()) o << "    stop only if " << b.condition << "\n";
@@ -1756,14 +2101,32 @@ static CmdResult cmd_bp_ops(const std::string& op, const std::vector<std::string
         // GDB: `delete` with no args removes all breakpoints
         for (auto it = g_bps.begin(); it != g_bps.end(); ) {
             Bpx& b = it->second;
-            if (b.kind == 0 && b.addr) DeleteBPX(b.addr);
-            else if (b.kind == 1) DeleteAPIBreakPoint(b.dll.c_str(), b.api.c_str(), UE_APISTART);
-            else if (b.kind == 2) DeleteHardwareBreakPoint(b.hwreg);
-            else if (b.kind == 3) RemoveMemoryBPX(b.addr, b.memsize);
+            if (!b.pending) {
+                if (b.kind == 0 && b.addr) DeleteBPX(b.addr);
+                else if (b.kind == 1) DeleteAPIBreakPoint(b.dll.c_str(), b.api.c_str(), UE_APISTART);
+                else if (b.kind == 2) DeleteHardwareBreakPoint(b.hwreg);
+                else if (b.kind == 3) RemoveMemoryBPX(b.addr, b.memsize);
+            }
             it = g_bps.erase(it);
         }
         CmdResult cr;
         cr.text = "deleted all breakpoints\n";
+        return cr;
+    }
+    if (args.empty() && (op == "disable" || op == "enable")) {
+        // GDB: `disable` / `enable` with no args applies to all breakpoints
+        for (auto& kv : g_bps) {
+            Bpx& b = kv.second;
+            if (op == "disable") {
+                if (!b.pending && b.kind == 0 && b.addr) DisableBPX(b.addr);
+                b.enabled = false;
+            } else {
+                if (!b.pending && b.kind == 0 && b.addr) EnableBPX(b.addr);
+                b.enabled = true;
+            }
+        }
+        CmdResult cr;
+        cr.text = (op == "disable" ? "disabled all breakpoints\n" : "enabled all breakpoints\n");
         return cr;
     }
     if (args.empty()) return {false, "usage: " + op + " <id ...>"};
@@ -1774,18 +2137,20 @@ static CmdResult cmd_bp_ops(const std::string& op, const std::vector<std::string
         if (it == g_bps.end()) { done << "no breakpoint " << id << "\n"; continue; }
         Bpx& b = it->second;
         if (op == "delete") {
-            if (b.kind == 0 && b.addr) DeleteBPX(b.addr);
-            else if (b.kind == 1) DeleteAPIBreakPoint(b.dll.c_str(), b.api.c_str(), UE_APISTART);
-            else if (b.kind == 2) DeleteHardwareBreakPoint(b.hwreg);
-            else if (b.kind == 3) RemoveMemoryBPX(b.addr, b.memsize);
+            if (!b.pending) {
+                if (b.kind == 0 && b.addr) DeleteBPX(b.addr);
+                else if (b.kind == 1) DeleteAPIBreakPoint(b.dll.c_str(), b.api.c_str(), UE_APISTART);
+                else if (b.kind == 2) DeleteHardwareBreakPoint(b.hwreg);
+                else if (b.kind == 3) RemoveMemoryBPX(b.addr, b.memsize);
+            }
             g_bps.erase(it);
             done << "deleted " << id << "\n";
         } else if (op == "disable") {
-            if (b.kind == 0 && b.addr) DisableBPX(b.addr);
+            if (!b.pending && b.kind == 0 && b.addr) DisableBPX(b.addr);
             b.enabled = false;
             done << "disabled " << id << "\n";
         } else { // enable
-            if (b.kind == 0 && b.addr) EnableBPX(b.addr);
+            if (!b.pending && b.kind == 0 && b.addr) EnableBPX(b.addr);
             b.enabled = true;
             done << "enabled " << id << "\n";
         }
@@ -1837,7 +2202,7 @@ static CmdResult cmd_hbreak(const std::vector<std::string>& args)
 {
     if (args.empty()) return {false, "usage: hbreak <addr> [r|w|x] [1|2|4|8]"};
     ULONG_PTR addr = 0;
-    if (!parse_addr(args[0], addr)) return {false, "bad address"};
+    if (!parse_addr(args[0], addr) && !sym_lookup(args[0], addr)) return {false, "bad address"};
     DWORD type = UE_HARDWARE_EXECUTE;
     DWORD size = UE_HARDWARE_SIZE_4;
     if (args.size() > 1) {
@@ -1995,8 +2360,8 @@ static CmdResult cmd_x(const std::string& arg)
         std::string digits;
         for (char c : spec) {
             if (isdigit((unsigned char)c)) digits += c;
-            else if (strchr("bhdwgi", c)) size = c;
-            else if (strchr("xduicsf", c)) fmt = c;
+            else if (strchr("bhdwg", c)) size = c;          // b=byte h=half w=word g=giant
+            else if (strchr("xduicsfi", c)) fmt = c;        // 'i' = instruction disassembly
             else if (strchr("o", c)) fmt = 'o';
         }
         if (!digits.empty()) count = atoi(digits.c_str());
@@ -2361,6 +2726,64 @@ static CmdResult cmd_info_modules()
     return cr;
 }
 
+// read the PE entry point (base + AddressOfEntryPoint) of the loaded image
+static ULONG_PTR pe_entry_point(ULONG_PTR base)
+{
+    if (!base) return 0;
+    IMAGE_DOS_HEADER dos = {};
+    SIZE_T nr = 0;
+    if (!mem_read(base, &dos, sizeof(dos), &nr) || nr < sizeof(dos)) return 0;
+    if (dos.e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    IMAGE_NT_HEADERS64 nth = {};
+    if (!mem_read(base + dos.e_lfanew, &nth, sizeof(nth), &nr) || nr < sizeof(nth)) return 0;
+    if (nth.Signature != IMAGE_NT_SIGNATURE) return 0;
+    // OptionalHeader is the 32-bit layout in a 32-bit image; the Magic field
+    // and AddressOfEntryPoint share the same offset in both layouts.
+    if (nth.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+        IMAGE_NT_HEADERS32 nt32 = {};
+        if (!mem_read(base + dos.e_lfanew, &nt32, sizeof(nt32), &nr) || nr < sizeof(nt32)) return 0;
+        if (nt32.OptionalHeader.AddressOfEntryPoint)
+            return base + nt32.OptionalHeader.AddressOfEntryPoint;
+        return 0;
+    }
+    if (nth.OptionalHeader.AddressOfEntryPoint)
+        return base + nth.OptionalHeader.AddressOfEntryPoint;
+    return 0;
+}
+
+// GDB `info files`: symbol file + exec file + entry point + loaded files.
+// (info modules stays a concise base/name list; info files is the verbose form.)
+static CmdResult cmd_info_files()
+{
+    if (!require_running()) return {false, "no active debug session"};
+    modules_refresh();
+    std::string exe = g_target.empty() ? std::string("(unknown)") : g_target;
+    ULONG_PTR base = GetDebuggedFileBaseAddress();
+    ULONG_PTR entry = pe_entry_point(base);
+    std::ostringstream j, t;
+    j << "{\"symbols\":\"" << js_str(exe) << "\",\"exec\":\"" << js_str(exe)
+      << "\",\"entry\":\"" << hex(entry) << "\",\"files\":[";
+    t << "Symbols from \"" << exe << "\".\n";
+    t << "Local exec file:\n";
+    t << "\t`" << exe << "', file type " << (target_is64() ? "pei-x86-64" : "pei-i386") << ".\n";
+    t << "\tEntry point: " << hex(entry) << "\n";
+    t << "\tLoaded files:\n";
+    bool first = true;
+    for (auto& m : g_mods) {
+        if (!first) j << ",";
+        first = false;
+        j << "{\"base\":\"" << hex(m.base) << "\",\"name\":\"" << js_str(m.name)
+          << "\",\"path\":\"" << js_str(m.path) << "\"}";
+        t << "\t  " << hex(m.base) << "  " << m.name
+          << (m.path.empty() ? "" : "  " + m.path) << "\n";
+    }
+    j << "]}";
+    CmdResult cr;
+    cr.js = j.str();
+    cr.text = t.str();
+    return cr;
+}
+
 // -- info threads / thread switching --
 static std::vector<THREAD_ITEM_W> g_thr_scratch;
 
@@ -2393,9 +2816,11 @@ static CmdResult cmd_info_threads()
         THREAD_ITEM_W& th = list[i];
         bool iscur = (th.dwThreadId == cur);
         j << "{\"id\":" << th.dwThreadId
+          << ",\"num\":" << (i + 1)
           << ",\"start\":\"" << hex((ULONG_PTR)th.ThreadStartAddress)
           << "\",\"current\":" << (iscur ? "true" : "false") << "}";
-        t << (iscur ? "* " : "  ") << th.dwThreadId << "  start=" << hex((ULONG_PTR)th.ThreadStartAddress) << "\n";
+        t << (iscur ? "* " : "  ") << (i + 1) << "  " << th.dwThreadId
+          << "  start=" << hex((ULONG_PTR)th.ThreadStartAddress) << "\n";
     }
     j << "]";
     CmdResult cr;
@@ -2416,12 +2841,15 @@ static CmdResult cmd_thread(const std::vector<std::string>& args)
         cr.text = "[Current thread is " + std::to_string(cur) + "]";
         return cr;
     }
-    DWORD tid = (DWORD)strtoul(args[0].c_str(), nullptr, 0);
+    DWORD arg = (DWORD)strtoul(args[0].c_str(), nullptr, 0);
     std::vector<THREAD_ITEM_W> list;
     enum_threads(list);
-    bool found = false;
-    for (auto& th : list) if (th.dwThreadId == tid) { found = true; break; }
-    if (!found) return {false, "no thread " + std::to_string(tid)};
+    // GDB: `thread <id>` uses the internal thread number (1..N). We also accept
+    // the raw OS tid. Prefer an exact tid match, then a 1-based internal number.
+    DWORD tid = 0;
+    for (auto& th : list) if (th.dwThreadId == arg) { tid = th.dwThreadId; break; }
+    if (!tid && arg >= 1 && arg <= (DWORD)list.size()) tid = list[arg - 1].dwThreadId;
+    if (!tid) return {false, "no thread " + std::to_string(arg)};
 
     if (tid == ctx_event_tid()) {
         ctx_reset();
@@ -2593,27 +3021,29 @@ static const char* HELP =
 "\n"
 "  file <path>                 set target executable\n"
 "  run [args] / r              start debugging (stops at initial breakpoint)\n"
-"  start                       like run, but always stop at the initial breakpoint\n"
+"  start [func]                like run, but stop at the entry function (main by default)\n"
 "  attach <pid>                attach to a running process\n"
 "  detach                      detach and leave target running\n"
 "  kill                        terminate the current run\n"
 "  continue / c / cont         resume execution\n"
 "  stepi / si / s / step       single-step instructions (s/step = source-line fallback)\n"
 "  nexti / ni / n / next       step over calls\n"
-"  finish / fin                run until the current function returns\n"
+"  finish / fin                run until the current function returns (stops in the caller)\n"
 "  break <addr> / b            set software breakpoint (*addr | addr | $reg | mod!api)\n"
 "  break <symbol>              set breakpoint by PDB symbol name (e.g. break main)\n"
-"  hbreak <addr> [r|w|x] [sz]  hardware breakpoint\n"
+"  break <line>                set breakpoint at a source line (e.g. break 31)\n"
+"  break <file.c>:<line>       set breakpoint at file.c:line (e.g. break main.c:13)\n"
+"  hbreak <addr|sym> [r|w|x]   hardware breakpoint (address or symbol)\n"
 "  mbreak <addr> <size> [r|w|x|a] memory breakpoint\n"
 "  watch / rwatch / awatch     write / read / access watchpoint on an address or symbol\n"
 "  condition <id> [expr]       set a stop condition (empty expr clears it)\n"
 "  ignore <id> <count>         ignore the next <count> hits of a breakpoint\n"
 "  info break / modules / threads / proc / events / regs\n"
 "  info locals / info args     show local variables / function parameters (PDB)\n"
-"  info files / target         (alias of info modules)\n"
+"  info files / target         info files = symbol/exec files; target = modules\n"
 "  delete / d <id...>          remove breakpoints (no ids = delete all)\n"
 "  disable/enable <id...>      toggle breakpoints\n"
-"  thread [id]                 show current thread / switch to <id> and inspect it\n"
+"  thread [id]                 show current thread / switch (id = internal # or tid)\n"
 "  registers / regs            show registers\n"
 "  list / l [func|line]        show source lines around the current stop (PDB)\n"
 "  print / p [/fmt] expr       print $reg | *addr | addr (fmt: x/d/t/c)\n"
@@ -2679,6 +3109,7 @@ static CmdResult execute(const std::string& line)
     if (cmd == "file") {
         if (tok.size() < 2) return {false, "usage: file <path>"};
         set_target_path(tok[1]);
+        sym_load_file(g_target);   // preload PDB so `break <symbol>` works before run
         CmdResult cr;
         cr.js = "{\"file\":\"" + js_str(g_target) + "\"}";
         cr.text = "target = " + g_target;
@@ -2789,7 +3220,8 @@ static CmdResult execute(const std::string& line)
         }
         if (what == "locals" || what == "local") return cmd_info_vars(false);
         if (what == "args" || what == "arguments") return cmd_info_vars(true);
-        if (what == "modules" || what == "files" || what == "target") return cmd_info_modules();
+        if (what == "modules" || what == "target") return cmd_info_modules();
+        if (what == "files") return cmd_info_files();
         if (what == "threads") return cmd_info_threads();
         if (what == "proc") return cmd_info_proc();
         if (what == "events") return cmd_info_events();
@@ -2852,8 +3284,18 @@ int main(int argc, char** argv)
             }
             g_default_args = rest;
             i = argc; // --args consumes the remainder of the command line
-        } else if (a == "--command") {
-            if (i + 1 < argc) single_cmd = argv[++i];
+        } else if (a == "--command" || a.rfind("--command=", 0) == 0) {
+            // GDB: `--command=FILE` runs a command file (-x). aidbg also accepts
+            // a single command string for AI use. If the argument names an
+            // existing file, honour the GDB meaning (run it as a command file).
+            std::string v;
+            if (a.rfind("--command=", 0) == 0) v = a.substr(10);
+            else if (i + 1 < argc) v = argv[++i];
+            if (!v.empty()) {
+                std::ifstream probe(v);
+                if (probe.good()) { script_file = v; probe.close(); }
+                else { single_cmd = v; }
+            }
         } else if (a == "--commands") {
             if (i + 1 < argc) script_file = argv[++i];
         } else if (a == "--help" || a == "-h") {

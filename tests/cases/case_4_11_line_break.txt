@@ -1,0 +1,11 @@
+# Case 4.11 - source-line breakpoint: file.c:NN (TestGuid.md section 4.1 / GDB `break <line>`)
+# Target: test_symbols.exe  (add() is at line 12, body at line 13)
+# Expected:
+#   - `break test_symbols.c:13` resolves to the address of line 13
+#   - `continue` stops inside `add` at line 13
+file test_symbols.exe
+start
+break test_symbols.c:13
+continue
+bt
+quit

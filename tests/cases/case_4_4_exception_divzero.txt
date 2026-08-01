@@ -1,0 +1,11 @@
+# Case 4.4 - exception capture: integer divide-by-zero (TestGuid.md section 4.4)
+# Target: test_exception.exe divzero
+# Expected:
+#   - execution stops with reason "exception"
+#   - exception code 0xc0000094 (INTEGER_DIVIDE_BY_ZERO) is reported
+#   - `info proc` shows pid and image base
+file test_exception.exe
+set args divzero
+run
+info proc
+quit

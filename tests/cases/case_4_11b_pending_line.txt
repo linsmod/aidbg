@@ -1,0 +1,11 @@
+# Case 4.11b - source-line breakpoint set BEFORE run (pending, GDB-style)
+# Target: test_symbols.exe
+# Expected:
+#   - `break test_symbols.c:15` before `run` resolves and is marked pending
+#   - `run` arms it and stops at line 15 inside `add`
+file test_symbols.exe
+break test_symbols.c:15
+info break
+run
+bt
+quit

@@ -1,0 +1,10 @@
+# Case 4.5 - single step and disassembly (TestGuid.md section 4.5)
+# Target: test_basic.exe
+# Expected:
+#   - `start` stops at main, then `stepi 3` advances 3 instructions
+#   - `disas` prints the instruction stream around the current rip
+file test_basic.exe
+start
+stepi 3
+disas
+quit

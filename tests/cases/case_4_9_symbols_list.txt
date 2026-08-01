@@ -1,0 +1,14 @@
+# Case 4.9 - symbol / source-line breakpoints (TestGuid.md section 4.9)
+# Target: test_symbols.exe
+# Note: `start` consumes breakpoint id 1, so `break add` becomes id 2.
+# Expected:
+#   - `break add` resolves the symbol to an address
+#   - `list` prints the source around `add` (test_symbols.c)
+#   - `bt` includes the `add` frame with file:line
+file test_symbols.exe
+start
+break add
+continue
+list
+bt
+quit

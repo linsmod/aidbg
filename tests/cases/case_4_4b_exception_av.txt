@@ -1,0 +1,10 @@
+# Case 4.4b - exception capture: access violation (TestGuid.md section 4.4)
+# Target: test_exception.exe av
+# Expected:
+#   - execution stops with reason "exception"
+#   - exception code 0xc0000005 (ACCESS_VIOLATION) is reported
+file test_exception.exe
+set args av
+run
+info proc
+quit

@@ -1,0 +1,10 @@
+# Case 4.13 - `info files` (GDB: symbol file + entry point + loaded files)
+# Target: test_basic.exe
+# Expected:
+#   - shows "Symbols from <exe>." and "Local exec file:"
+#   - entry point resolves to a non-zero address
+#   - loaded files list includes the target exe
+file test_basic.exe
+start
+info files
+quit

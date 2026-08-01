@@ -386,3 +386,6 @@ if %errorlevel% neq 0 echo Test failed!
 3. **极限场景层面**：在 Release 优化程序上验证反汇编和指令级控制，确保调试器在逆向场景下的稳定性。
 
 建议持续维护这些测试用例，并在每次代码变更后执行回归测试，确保调试器的稳定性和功能完整性。
+
+C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe
+C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\amd64\MSBuild.exe

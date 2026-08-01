@@ -1,0 +1,17 @@
+# Case 4.6 - variables: info args / info locals / register write (TestGuid.md section 4.6)
+# Target: test_basic.exe  (stops at the first func2() call: a=0, b=0)
+# Expected:
+#   - `info args` lists the parameters a and b
+#   - `info locals` lists the local `local`
+#   - `set $rax = 5` writes the register; `print $rax` reports 5
+# NOTE: aidbg's `print` accepts registers/literals, not bare identifiers,
+#       so `print a` from the guide is exercised via `info args` instead.
+file test_basic.exe
+start
+break func2
+continue
+info args
+info locals
+set $rax = 5
+print $rax
+quit

@@ -1,0 +1,8 @@
+# Case 4.11c - out-of-range source line (GDB: "No line N in file.c")
+# Target: test_symbols.exe
+# Expected:
+#   - `break test_symbols.c:999` fails cleanly instead of clamping to the last line
+file test_symbols.exe
+start
+break test_symbols.c:999
+quit

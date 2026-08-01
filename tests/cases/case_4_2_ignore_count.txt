@@ -1,0 +1,14 @@
+# Case 4.2 - conditional breakpoint / ignore count (TestGuid.md section 4.2)
+# Target: test_basic.exe  (func1 is called 3 times: i = 0, 1, 2)
+# Note: `start` consumes breakpoint id 1 with its temporary entry breakpoint,
+#       so `break func1` becomes id 2 (GDB-consistent numbering).
+# Expected:
+#   - `ignore 2 2` skips the first two hits, stops on the third -> "hit 3"
+#   - `info break` shows the breakpoint already hit 3 times
+file test_basic.exe
+start
+break func1
+ignore 2 2
+continue
+info break
+quit

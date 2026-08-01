@@ -1,0 +1,11 @@
+# Case 4.1 - basic breakpoint verification (TestGuid.md section 4.1)
+# Target: test_basic.exe
+# Expected:
+#   - `start` stops at the entry function `main` via a temporary breakpoint
+#   - `bt` shows a call chain containing main / mainCRTStartup
+#   - program exits normally
+file test_basic.exe
+start
+bt
+continue
+quit

@@ -1,0 +1,14 @@
+# Case 4.7 - thread enumeration (TestGuid.md section 4.7)
+# Target: test_threads.exe  (spawns 2 worker threads + main thread)
+# Expected:
+#   - stops at the `thread_func` breakpoint
+#   - `info threads` lists at least 3 threads
+# NOTE: thread switching (`thread <id>`) is validated by the Python runner,
+#       which parses a thread id from `info threads` output, because the
+#       thread ids are non-deterministic and cannot be hard-coded here.
+file test_threads.exe
+start
+break thread_func
+continue
+info threads
+quit

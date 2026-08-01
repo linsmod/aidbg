@@ -1,0 +1,11 @@
+# Case 4.10 - memory search for a byte pattern (TestGuid.md section 4.10)
+# Target: test_basic.exe
+# Expected:
+#   - `search` finds the ASCII "Hello" (48 65 6c 6c 6f) somewhere in the
+#     image; the module base is fixed at 0x140000000 (/DYNAMICBASE:NO).
+# NOTE: the returned address is parsed by the Python runner which then runs
+#       `strings <addr> <size>` to confirm "Hello, aidbg!" is found.
+file test_basic.exe
+start
+search 0x140000000 0x1000000 48656c6c6f
+quit

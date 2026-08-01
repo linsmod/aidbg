@@ -1,0 +1,12 @@
+# Case 4.3 - memory breakpoint / watchpoint (TestGuid.md section 4.3)
+# Target: test_memory.exe  (main() does memset(data, ...) then write_data())
+# Expected:
+#   - `watch data` arms a memory write breakpoint on the global array
+#   - execution stops with reason "memory" when data is written
+#   - `info break` lists the mem/watch breakpoint
+file test_memory.exe
+start
+watch data
+continue
+info break
+quit

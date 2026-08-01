@@ -1,0 +1,115 @@
+# aidbg 测试套件（tests/）
+
+本目录根据 `TestGuid.md` 构建一套针对 `aidbg`（基于 TitanEngine 的 GDB 风格调试器）
+的自动化测试：测试程序源码、编译脚本、每节测试用例的 aidbg 命令脚本，以及一个
+Python 驱动的测试运行器。
+
+## 目录结构
+
+```
+tests/
+  src/                 测试程序源码（TestGuid.md 第 3 节）
+    test_basic.c       基础功能：断点 / ignore / condition / locals / stepi / search
+    test_memory.c      内存 / 观察点（全局数组读写）
+    test_exception.c   异常：除零(divzero) / 访问违例(av)
+    test_threads.c     多线程：两个工作线程 + 主线程
+    test_symbols.c     符号与源码定位：add() 函数
+    test_attach.c      常驻目标：供 attach/detach 测试
+  cases/               各测试用例的 aidbg 命令脚本（TestGuid.md 第 4 节）
+  build.cmd            MSVC 编译脚本（方案 B 专用参数，见下）
+  run_tests.py         Python 测试运行器
+  run_tests.cmd        run_tests.py 的 cmd 封装
+```
+
+## 快速开始
+
+```cmd
+set _NT_SYMBOL_PATH=%CD%\..
+
+tests\build.cmd              :: 编译全部测试目标（输出到仓库根，紧邻 aidbg.exe）
+tests\run_tests.cmd          :: 运行全部用例并报告 PASS/FAIL
+tests\run_tests.cmd --case 4.4   :: 只运行某个用例
+```
+
+运行器会自动检测缺失的 exe 并调用 `build.cmd`；可加 `--no-build` 跳过。
+
+## 编译策略（TestGuid.md 第 5 节）
+
+所有测试目标统一使用**方案 B（内部专用构建）**以保证符号与变量命令稳定：
+
+```
+cl /nologo /Zi /Od /Oy- /GS- /MTd /Fe:<target>.exe <target>.c /link /DEBUG:FULL /DYNAMICBASE:NO
+```
+
+- `/DEBUG:FULL`：完整 PDB，`info locals` / `info args` / `list` 依赖它。
+- `/Od`：禁用优化，变量不被优化进寄存器/内联。
+- `/Oy-`：保留帧指针，辅助 x86 栈回溯（本套件为 x64）。
+- `/DYNAMICBASE:NO`：固定模块基址 `0x140000000`，`search 0x140000000 ...`
+  这类硬编码地址在回归测试中可用。
+
+## 测试用例与 TestGuid.md 映射
+
+| 用例 | 脚本 | 验证点 | 预期 |
+| :--- | :--- | :--- | :--- |
+| 4.1 | `case_4_1_basic_break.txt` | `start` 停在 main + bt | `Temporary breakpoint 1, main`，`bt` 含 `main` |
+| 4.1b | `case_4_1b_pending_break.txt` | **run 前符号断点**（A1） | `break main` 标 `pending`，run 后命中 |
+| 4.2 | `case_4_2_ignore_count.txt` | ignore 计数 | `ignore 2 2` 后第 3 次命中才停（`hit 3`） |
+| 4.2b | `case_4_2b_condition.txt` | 条件断点（全局变量） | `g_loop_index == 2` 时停（`hit 3`） |
+| 4.3 | `case_4_3_memory_watch.txt` | 内存观察点 | `watch data` 命中，`Stopped: memory` |
+| 4.4 | `case_4_4_exception_divzero.txt` | 除零异常 | `exception 0xc0000094` |
+| 4.4b | `case_4_4b_exception_av.txt` | 访问违例 | `exception 0xc0000005` |
+| 4.5 | `case_4_5_stepi_disas.txt` | 指令单步 + 反汇编 | `stepi 3` 后 `disas` 输出指令 |
+| 4.6 | `case_4_6_locals_args.txt` | 变量枚举 + 寄存器写 | `info args`/`info locals`，`set $rax=5` |
+| 4.7 | `case_4_7_threads.txt` | 线程枚举 | 停在 `thread_func`，`info threads` 多线程 |
+| 4.7b | （运行器动态驱动） | 线程切换 + bt | `thread <id>` 切换后 `bt` 有帧 |
+| 4.8 | （运行器动态驱动） | 附加与分离 | attach 成功、命中断点、detach 后目标仍在 |
+| 4.9 | `case_4_9_symbols_list.txt` | 符号断点 / list / bt | `break add`，`list` 显示源码，`bt` 含 `add` |
+| 4.10 | `case_4_10_search.txt` | 内存搜索 | `search` 命中 "Hello"，`strings` 确认 |
+| 4.11 | `case_4_11_line_break.txt` | 源码行断点 `file.c:NN` | 停在 `add () at test_symbols.c:13` |
+| 4.11b | `case_4_11b_pending_line.txt` | 行号断点 run 前 pending | `break test_symbols.c:15` → run 后命中 |
+| 4.11c | `case_4_11c_line_oob.txt` | 超范围行号 | 报错 `No line 999 ...` |
+| 4.12 | `case_4_12_gdb_compat.txt` | GDB 兼容（finish/x-i/disable） | `main+0x21`、`MOV`、`disabled all breakpoints` |
+| 4.13 | `case_4_13_info_files.txt` | `info files`（符号/入口/加载文件） | `Symbols from ...`、`Entry point: 0x...` |
+
+> **断点编号**：`start` 的一次性入口断点占用 id 1（GDB 一致），因此 4.2/4.2b 的
+> `break func1` 为 id 2、4.9 的 `break add` 为 id 2，脚本与断言均已按此编号。
+
+### 用例 4.7b / 4.8 / 4.10b（动态用例）
+
+这三个场景的值（线程 id、PID、搜索命中地址）在每次运行都不同，无法写死在脚本里，
+因此由 `run_tests.py` 在运行时动态驱动：
+
+- **4.7b**：解析 `info threads` 输出 → 取一个非当前线程 → `thread <id>` + `bt`。
+- **4.8**：`Popen` 启动 `test_attach.exe` → 取其 PID → `attach <pid>` →
+  `break tick_func` → `continue` → `bt` → `detach` → 确认目标仍存活。
+- **4.10b**：解析 `search` 返回的地址 → `strings <addr> 0x1000` → 确认含
+  `Hello, aidbg!`。
+
+## 与 TestGuid.md 的差异说明（实现现实）
+
+测试套件基于 aidbg 的**实际行为**编写，与文档示例有几处适配：
+
+1. **`start` 与 GDB 一致：停在 `main`（或 `start <func>`）**，输出
+   `Temporary breakpoint 1, main () at file.c:line`。
+2. **`break <symbol>` 可在 `run` 之前设置**（A1 已实现）：`file` 预加载 PDB，断点标
+   pending，`run` 启动后落地（见 4.1b）。
+3. **异常用例按输出文本断言**，不断言退出码。aidbg 在 batch 模式下 `quit`
+   会先行解除 stop 等待，进程随后退出，`final_reason` 存在竞态，退出码不可靠。
+4. **`print a`（裸标识符）不受支持**，`print` 只接受 `$reg` / 字面量 / `*addr`。
+   因此 4.6 用 `info args` 代替 `print a` 验证参数值。
+5. **`hbreak`/`search`/`strings` 只接受地址**（符号需要先经 `start` 解析），
+   且 `/DYNAMICBASE:NO` 固定了基址，故搜索/反汇编用例使用显式地址。
+6. 线程 id、PID 为非确定性值 → 动态用例由运行器驱动（见上）。
+7. `start` 的一次性入口断点占用断点编号 1，用户断点从 2 开始（与 GDB 一致）。
+8. **`break <行号>`（GDB 语义）**：`break 31` 取当前源码文件第 31 行（运行中取
+   `rip` 所在文件，run 前取 `main` 所在文件）；`break file.c:NN` 指定文件。超范围
+   行号报 `No line N ...`（dbghelp 默认会静默钳制到末行，已用交叉校验拒绝）。
+9. **GDB 兼容修复（handover3.md）**：`finish` 停在调用方返回后（`main+0x21`）、
+   `x/i` 反汇编、`hbreak` 支持符号名、`--command <file>` 按 GDB 语义执行命令文件、
+   `thread <内部编号>` 切换（`info threads` 显示 `* 1 <tid>`）、`disable`/`enable`
+   无参作用于全部断点、`info files` 输出符号文件/入口点/加载文件。
+
+## 退出码约定
+
+`run_tests.py` 全绿返回 0，任一断言失败返回 1，便于接入 CI：
+`tests\run_tests.cmd || exit /b 1`

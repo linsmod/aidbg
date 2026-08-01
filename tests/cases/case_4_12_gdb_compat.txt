@@ -1,0 +1,15 @@
+# Case 4.12 - GDB compatibility fixes (handover3.md section 1-6)
+# Target: test_symbols.exe
+# Expected:
+#   - `finish` stops in the CALLER (main) after returning from add, not in add
+#   - `x/3i` disassembles instructions instead of dumping hex
+#   - `disable` with no args disables all breakpoints
+file test_symbols.exe
+start
+break add
+continue
+finish
+x/3i
+disable
+info break
+quit

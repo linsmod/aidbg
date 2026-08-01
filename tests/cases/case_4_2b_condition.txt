@@ -1,0 +1,13 @@
+# Case 4.2b - breakpoint condition on a global variable (TestGuid.md section 4.2)
+# Target: test_basic.exe  (g_loop_index is set to i before func1(i))
+# Note: `start` consumes breakpoint id 1, so `break func1` becomes id 2.
+# Expected:
+#   - condition `g_loop_index == 2` stops only on the third call -> "hit 3"
+#   - `info break` lists the condition
+file test_basic.exe
+start
+break func1
+condition 2 g_loop_index == 2
+continue
+info break
+quit

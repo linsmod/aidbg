@@ -1,0 +1,12 @@
+# Case 4.1b - pending symbol breakpoint set BEFORE run (TestGuid.md section 4.1)
+# Target: test_basic.exe
+# Expected:
+#   - `break main` before `run` resolves via the PDB and is marked pending
+#   - `run` arms it and stops at main
+#   - `bt` shows the call chain containing main
+file test_basic.exe
+break main
+info break
+run
+bt
+quit

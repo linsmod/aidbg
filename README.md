@@ -55,19 +55,18 @@ aidbg.exe --json --command "bt" target.exe
 
 ### 构建（源码）
 
-依赖：Visual Studio 2022（MSVC，C++17）+ TitanEngine（见下）。
+依赖：Visual Studio 2022（MSVC，C++17）和 CMake。TitanEngine 与 x64dbg 一样作为
+Git submodule 固定在官方 `x64dbg` 分支的 `ccac889`；仓库不再提交预编译 DLL。
 
 ```cmd
-cl /nologo /std:c++17 /EHsc /O2 /utf-8 aidbg.cpp /Fe:aidbg.exe TitanEngine.lib
-copy /y <TitanEngine 构建产物>\TitanEngine.dll .
+git clone --recurse-submodules https://github.com/linsmod/-vc-dev-debuging-tool-for-ai-agent aidbg
+cd aidbg
+cmake -S . -B build -A x64
+cmake --build build --config Release
 ```
 
-TitanEngine 构建（官方 `x64dbg` 分支，commit `ccac889`）：
-
-```cmd
-cmake -B build_x64 -A x64
-cmake --build build_x64 --config Release
-```
+构建结果位于 `build\bin\`，其中包含可直接运行的 `aidbg.exe` 和 `TitanEngine.dll`。
+已有 clone 可运行 `git submodule update --init --recursive` 初始化依赖。
 
 ## AI 使用示例
 

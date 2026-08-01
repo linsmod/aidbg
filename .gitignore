@@ -2,3 +2,6 @@
 *.obj
 *.ilk
 *.pdb
+
+/build/
+/TitanEngine.dll

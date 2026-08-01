@@ -192,5 +192,5 @@
 `DBG_EXCEPTION_NOT_HANDLED` 并进入被调试程序的 SEH。
 
 用例 4.15 同时验证 `DebugBreak()` 正常续跑、没有重复停止，以及
-`RaiseException(STATUS_BREAKPOINT)` 的 SEH 处理器仍执行。仓库中的 `TitanEngine.dll`
-恢复为官方 `x64dbg` 分支构建，不再携带私有异常语义补丁。
+`RaiseException(STATUS_BREAKPOINT)` 的 SEH 处理器仍执行。TitanEngine 以与 x64dbg 相同的
+官方 submodule revision 构建；仓库不再携带预编译 DLL 或私有异常语义补丁。

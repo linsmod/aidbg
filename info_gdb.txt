@@ -1,0 +1,78 @@
+File: gdb.info,  Node: Top,  Next: Summary,  Up: (dir)
+
+Debugging with GDB
+******************
+
+This file describes GDB, the GNU symbolic debugger.
+
+   This is the Tenth Edition, for GDB (Ubuntu 12.1-0ubuntu1~22.04.2)
+Version .
+
+   Copyright (C) 1988-2022 Free Software Foundation, Inc.
+
+   This edition of the GDB manual is dedicated to the memory of Fred
+Fish.  Fred was a long-standing contributor to GDB and to Free software
+in general.  We will miss him.
+
+* Menu:
+
+* Summary::                     Summary of GDB
+* Sample Session::              A sample GDB session
+
+* Invocation::                  Getting in and out of GDB
+* Commands::                    GDB commands
+* Running::                     Running programs under GDB
+* Stopping::                    Stopping and continuing
+* Reverse Execution::           Running programs backward
+* Process Record and Replay::   Recording inferior's execution and replaying it
+* Stack::                       Examining the stack
+* Source::                      Examining source files
+* Data::                        Examining data
+* Optimized Code::              Debugging optimized code
+* Macros::                      Preprocessor Macros
+* Tracepoints::                 Debugging remote targets non-intrusively
+* Overlays::                    Debugging programs that use overlays
+
+* Languages::                   Using GDB with different languages
+
+* Symbols::                     Examining the symbol table
+* Altering::                    Altering execution
+* GDB Files::                   GDB files
+* Targets::                     Specifying a debugging target
+* Remote Debugging::            Debugging remote programs
+* Configurations::              Configuration-specific information
+* Controlling GDB::             Controlling GDB
+* Extending GDB::               Extending GDB
+* Interpreters::		Command Interpreters
+* TUI::                         GDB Text User Interface
+* Emacs::                       Using GDB under GNU Emacs
+* GDB/MI::                      GDB's Machine Interface.
+* Annotations::                 GDB's annotation interface.
+* JIT Interface::               Using the JIT debugging interface.
+* In-Process Agent::            In-Process Agent
+
+* GDB Bugs::                    Reporting bugs in GDB
+
+* Command Line Editing: (rluserman).         Command Line Editing
+* Using History Interactively: (history).    Using History Interactively
+* In Memoriam::                 In Memoriam
+* Formatting Documentation::    How to format and print GDB documentation
+* Installing GDB::              Installing GDB
+* Maintenance Commands::        Maintenance Commands
+* Remote Protocol::             GDB Remote Serial Protocol
+* Agent Expressions::           The GDB Agent Expression Mechanism
+* Target Descriptions::         How targets can describe themselves to
+                                GDB
+* Operating System Information:: Getting additional information from
+                                 the operating system
+* Trace File Format::		GDB trace file format
+* Index Section Format::        .gdb_index section format
+* Debuginfod::                  Download debugging resources with 'debuginfod'
+* Man Pages::			Manual pages
+* Copying::			GNU General Public License says
+                                how you can copy and share GDB
+* GNU Free Documentation License::  The license for this documentation
+* Concept Index::               Index of GDB concepts
+* Command and Variable Index::  Index of GDB commands, variables,
+                                  functions, and Python data types
+

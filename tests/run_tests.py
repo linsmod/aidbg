@@ -39,7 +39,7 @@ BUILD_CMD = os.path.join(HERE, "build.cmd")
 PYTHON = sys.executable
 
 TARGETS = ["test_basic", "test_memory", "test_exception", "test_threads",
-           "test_symbols", "test_attach", "test_checksum"]
+           "test_symbols", "test_attach", "test_checksum", "test_debugbreak"]
 
 
 # ------------------------------------------------------------------- helpers ---
@@ -311,6 +311,50 @@ def case_source_checksum():
     return results
 
 
+def case_debugbreak():
+    """Case 4.15 - program-generated DebugBreak()/int 3.
+
+    A program with DebugBreak() in the middle writes dbgbrk_before.flag and
+    dbgbrk_after.flag into its working directory. With the TitanEngine fix the
+    stray int 3 is consumed (DBG_CONTINUE, like VS): aidbg stops ONCE at the
+    int 3 and `continue` resumes past it, so the after-flag must exist and the
+    process must exit cleanly. A regression (double-stop / NOT_HANDLED) leaves
+    the process stuck or crashing and the after-flag missing.
+    """
+    results = []
+    exe = os.path.join(ROOT, "test_debugbreak.exe")
+    before = os.path.join(ROOT, "dbgbrk_before.flag")
+    after = os.path.join(ROOT, "dbgbrk_after.flag")
+
+    script = os.path.join(HERE, "_case_4_15_dbgbrk.txt")
+    with open(script, "w", encoding="utf-8") as f:
+        f.write("\n".join([
+            "file %s" % exe,
+            "start",
+            "continue",
+            "continue",
+            "quit",
+        ]) + "\n")
+    try:
+        p = subprocess.run([AIDBG, "--batch", "-x", script], cwd=ROOT,
+                           capture_output=True, text=True, timeout=90,
+                           encoding="utf-8", errors="replace")
+        out = p.stdout + p.stderr
+        stops = out.count("Stopped:")
+        results.append(("program ran before DebugBreak",
+                        os.path.exists(before), out))
+        results.append(("single stop at the int 3 (no double-stop)",
+                        stops <= 2, out))
+        results.append(("resumed past DebugBreak (after flag written)",
+                        os.path.exists(after), out))
+    finally:
+        os.unlink(script)
+        for f in (before, after):
+            if os.path.exists(f):
+                os.unlink(f)
+    return results
+
+
 # ------------------------------------------------------------- case table ---
 
 CASES = [
@@ -424,6 +468,13 @@ CASES = [
         "expect": None,
         "dynamic": "checksum",
     },
+    {
+        "id": "4.15",
+        "name": "DebugBreak() continuation (TitanEngine fix)",
+        "script": None,
+        "expect": None,
+        "dynamic": "debugbreak",
+    },
 ]
 
 
@@ -462,6 +513,8 @@ def main():
             results = case_search_strings()
         elif case.get("dynamic") == "checksum":
             results = case_source_checksum()
+        elif case.get("dynamic") == "debugbreak":
+            results = case_debugbreak()
         else:
             results = run_case(case)
         all_cases.append((case["id"], case["name"], results))

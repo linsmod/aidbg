@@ -169,3 +169,30 @@
   `set source-checksum on` 时校验并告警（默认 off，避免干扰）。
 - `list` 的 JSON 输出已从数组改为 `{"lines":[...]}`（新增可选 `"checksum"` 字段），
   schema 变化请以 4.14 用例为准。
+
+## G. 程序自身 int3 / DebugBreak()（**已修复**，TitanEngine fork）
+
+**现象（修复前实测）**：`DebugBreak()` / `__debugbreak()`（程序生成的 `int 3`）在 aidbg
+下不能正确工作：首轮停止被误报为 `breakpoint`，继续后停为 `exception 0x80000003`
+（第二次机会），地址振荡、多次 continue；最终进程以 `0x80000003` 退出或 SEH 处理器
+不执行。`After DebugBreak` 永不打印。
+
+**根因（TitanEngine `DebugLoop.cpp`）**：游离 int3（不在断点表）被置
+`DBGCode = DBG_EXCEPTION_NOT_HANDLED` 并回调 `chBreakPoint`（aidbg `cb_program_bp`）。
+NOT_HANDLED 使异常穿透到被调试程序 → 无 SEH 则二次机会崩溃、有 SEH 则被拦截执行，
+均非调试器对 DebugBreak 的预期行为。
+
+**修复（改 TitanEngine fork，`TitanEngine.Debugger.DebugLoop.cpp` 游离 int3 分支）**：
+改为 `DBGCode = DBG_CONTINUE`（同 VS）。单字节 `int 3` 触发异常时 CPU 已把 RIP 指向
+int3 之后的指令，`DBG_CONTINUE` 应答即按当前上下文恢复，无需写任何寄存器（寄存器
+回卷 `Rip -= BreakPointSize` 仅用于调试器自己下到内存的断点，见 DebugLoop.cpp:556）。
+
+**修复后实测**：
+- `DebugBreak()` / `__debugbreak()` / 带 SEH 处理器三种场景均**只停一次**（报
+  `breakpoint`，地址 `DebugBreak+0x3`），`continue` 后程序越过 int3 正常跑完、退出码 0；
+- 用例 4.15（`test_debugbreak.exe` 写 before/after 标记文件）验证：单停 + after 标记
+  存在 + 无回归；全套 21 项通过。
+- **注意**：`DBG_CONTINUE` 会消费异常，程序自身的 `__try/__except(STATUS_BREAKPOINT)`
+  处理器在调试器下不会执行（与 VS 一致）；停止原因仍显示为 `breakpoint`（待美化，
+  可改为 `exception 0x80000003` 更准确）。
+- **依赖**：需要随发行版一起替换 `TitanEngine.dll`（本仓库已跟踪该二进制）。

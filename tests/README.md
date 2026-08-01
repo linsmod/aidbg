@@ -71,6 +71,7 @@ cl /nologo /Zi /Od /Oy- /GS- /MTd /Fe:<target>.exe <target>.c /link /DEBUG:FULL 
 | 4.12 | `case_4_12_gdb_compat.txt` | GDB 兼容（finish/x-i/disable） | `main+0x21`、`MOV`、`disabled all breakpoints` |
 | 4.13 | `case_4_13_info_files.txt` | `info files`（符号/入口/加载文件） | `Symbols from ...`、`Entry point: 0x...` |
 | 4.14 | （运行器动态驱动） | 源码/PDB 校验（`info source`、list 警告） | 源未改动 `Checksum: ok`；篡改后 `mismatch` + `!! Checksum mismatch`（仅开关开启时） |
+| 4.15 | （运行器动态驱动） | `DebugBreak()` 程序 int3 续跑（TitanEngine 修复） | 只停一次、before/after 标记齐全、进程正常退出 |
 
 > **断点编号**：`start` 的一次性入口断点占用 id 1（GDB 一致），因此 4.2/4.2b 的
 > `break func1` 为 id 2、4.9 的 `break add` 为 id 2，脚本与断言均已按此编号。
@@ -88,6 +89,10 @@ cl /nologo /Zi /Od /Oy- /GS- /MTd /Fe:<target>.exe <target>.c /link /DEBUG:FULL 
 - **4.14**：对 `test_checksum.exe` 先 `info source` 断言 `ok`；二进制篡改源文件后断言
   `mismatch`；`set source-checksum on` 下 `list` 输出 `!! Checksum mismatch`；
   关闭时静默。`finally` 中按字节恢复源文件（避免文本模式改写行尾导致 PDB 校验失配）。
+- **4.15**：`test_debugbreak.exe` 在 `DebugBreak()` 前后写 `dbgbrk_before/after.flag`
+  （cwd 相对路径，运行器以 ROOT 为 cwd）。断言只停一次（`Stopped:` 计数 <= 2）且
+  after 标记存在 → 证明程序越过 int3 正常继续（依赖 TitanEngine fork 的
+  `DBG_CONTINUE` 修复）。`finally` 清理标记文件。
 
 ## 与 TestGuid.md 的差异说明（实现现实）
 

@@ -26,6 +26,8 @@ Windows 原生调试器：单文件 C++17 实现，x64 Release 仅约 500KB，�
 - **深度符号**：dbghelp 加载 PDB；`info locals` / `info args` 枚举局部变量与参数，
   `bt` 基于 `StackWalk64`（优化构建下依然稳定）。
 - **异常拦截**：除零 `0xc0000094`、访问违例 `0xc0000005` 等精确停住并报告。
+- **程序自身 int3（DebugBreak）**：对齐 VS，停一次即可 `continue` 越过
+  `DebugBreak()` / `__debugbreak()` 继续执行（需配套本仓库跟踪的 TitanEngine.dll）。
 - **多线程 / 附加**：线程枚举、上下文切换、跨线程回溯；`attach <pid>` / `detach`。
 
 ## 快速开始

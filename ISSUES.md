@@ -183,9 +183,11 @@ NOT_HANDLED 使异常穿透到被调试程序 → 无 SEH 则二次机会崩溃�
 均非调试器对 DebugBreak 的预期行为。
 
 **修复（改 TitanEngine fork，`TitanEngine.Debugger.DebugLoop.cpp` 游离 int3 分支）**：
-改为 `DBGCode = DBG_CONTINUE`（同 VS）。单字节 `int 3` 触发异常时 CPU 已把 RIP 指向
-int3 之后的指令，`DBG_CONTINUE` 应答即按当前上下文恢复，无需写任何寄存器（寄存器
-回卷 `Rip -= BreakPointSize` 仅用于调试器自己下到内存的断点，见 DebugLoop.cpp:556）。
+先读 `ExceptionAddress` 处字节判别——**真实单字节 `int 3`（0xCC）**才 `DBG_CONTINUE`
+（同 VS；单字节 int3 触发异常时 CPU 已把 RIP 指到其后的指令，无需写寄存器，寄存器
+回卷 `Rip -= BreakPointSize` 仅用于调试器自设断点，见 DebugLoop.cpp:556）；**其余
+情况（如 `RaiseException(0x80000003)`）保持 `DBG_EXCEPTION_NOT_HANDLED` 原语义**，
+因此对其他异常处理功能无影响（实测 `RaiseException`+`__except` 行为与修复前一致）。
 
 **修复后实测**：
 - `DebugBreak()` / `__debugbreak()` / 带 SEH 处理器三种场景均**只停一次**（报

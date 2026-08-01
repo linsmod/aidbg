@@ -41,19 +41,30 @@ PYTHON = sys.executable
 TARGETS = ["test_basic", "test_memory", "test_exception", "test_threads",
            "test_symbols", "test_attach", "test_checksum", "test_debugbreak"]
 
+# Never let the spawned aidbg / test targets pop their own console windows.
+# (The debuggee itself is additionally hidden via `set engine console on`,
+# which makes TitanEngine create it with CREATE_NO_WINDOW.)
+CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+
 
 # ------------------------------------------------------------------- helpers ---
 
 def run(cmd, timeout=120):
     """Run a command, capture stdout, return (exit_code, output)."""
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                       encoding="utf-8", errors="replace")
+                       encoding="utf-8", errors="replace",
+                       creationflags=CREATE_NO_WINDOW)
     return p.returncode, p.stdout + p.stderr
 
 
 def aidbg_run(script):
-    """Run `aidbg --batch -x <script>` and return (exit_code, output)."""
-    return run([AIDBG, "--batch", "-x", script], timeout=90)
+    """Run `aidbg --batch -x <script>` and return (exit_code, output).
+
+    `-ex "set engine console on"` is injected before the script so every
+    debuggee is created with CREATE_NO_WINDOW (no console window pops up).
+    """
+    return run([AIDBG, "--batch", "-ex", "set engine console on", "-x", script],
+               timeout=90)
 
 
 def aidbg_session(cmds, marker="===AIDBG_MARKER===", timeout=90):
@@ -67,9 +78,10 @@ def aidbg_session(cmds, marker="===AIDBG_MARKER===", timeout=90):
     """
     p = subprocess.Popen([AIDBG], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, text=True,
-                         encoding="utf-8", errors="replace")
+                         encoding="utf-8", errors="replace",
+                         creationflags=CREATE_NO_WINDOW)
     assert p.stdin and p.stdout
-    p.stdin.write("\n".join(cmds) + "\n")
+    p.stdin.write("\n".join(["set engine console on"] + list(cmds)) + "\n")
     p.stdin.flush()
     # read incrementally until the marker shows up
     collected = ""
@@ -199,7 +211,7 @@ def case_attach_detach():
     results = []
     attach_exe = os.path.join(ROOT, "test_attach.exe")
     p = subprocess.Popen([attach_exe], cwd=ROOT, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL)
+                         stderr=subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW)
     try:
         time.sleep(1.0)   # let it spin up and print its PID
         pid = p.pid
@@ -336,9 +348,11 @@ def case_debugbreak():
             "quit",
         ]) + "\n")
     try:
-        p = subprocess.run([AIDBG, "--batch", "-x", script], cwd=ROOT,
+        p = subprocess.run([AIDBG, "--batch", "-ex", "set engine console on",
+                            "-x", script], cwd=ROOT,
                            capture_output=True, text=True, timeout=90,
-                           encoding="utf-8", errors="replace")
+                           encoding="utf-8", errors="replace",
+                           creationflags=CREATE_NO_WINDOW)
         out = p.stdout + p.stderr
         stops = out.count("Stopped:")
         results.append(("program ran before DebugBreak",

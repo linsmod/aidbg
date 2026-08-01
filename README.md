@@ -26,8 +26,8 @@ Windows 原生调试器：单文件 C++17 实现，x64 Release 仅约 500KB，�
 - **深度符号**：dbghelp 加载 PDB；`info locals` / `info args` 枚举局部变量与参数，
   `bt` 基于 `StackWalk64`（优化构建下依然稳定）。
 - **异常拦截**：除零 `0xc0000094`、访问违例 `0xc0000005` 等精确停住并报告。
-- **程序自身 int3（DebugBreak）**：对齐 VS，停一次即可 `continue` 越过
-  `DebugBreak()` / `__debugbreak()` 继续执行（需配套本仓库跟踪的 TitanEngine.dll）。
+- **程序自身 int3（DebugBreak）**：停一次即可用 `continue` 越过；aidbg 通过
+  TitanEngine 的继续状态 API 明确消费该异常，无需修改调试引擎的默认异常语义。
 - **多线程 / 附加**：线程枚举、上下文切换、跨线程回溯；`attach <pid>` / `detach`。
 
 ## 快速开始
@@ -55,19 +55,18 @@ aidbg.exe --json --command "bt" target.exe
 
 ### 构建（源码）
 
-依赖：Visual Studio 2022（MSVC，C++17）+ TitanEngine（见下）。
+依赖：Visual Studio 2022（MSVC，C++17）和 CMake。TitanEngine 与 x64dbg 一样作为
+Git submodule 固定在官方 `x64dbg` 分支的 `ccac889`；仓库不再提交预编译 DLL。
 
 ```cmd
-cl /nologo /std:c++17 /EHsc /O2 /utf-8 aidbg.cpp /Fe:aidbg.exe TitanEngine.lib
-copy /y <TitanEngine 构建产物>\TitanEngine.dll .
+git clone --recurse-submodules https://github.com/linsmod/-vc-dev-debuging-tool-for-ai-agent aidbg
+cd aidbg
+cmake -S . -B build -A x64
+cmake --build build --config Release
 ```
 
-TitanEngine 构建（x64dbg 增强版 v2.0.3，commit ec7a8b9）：
-
-```cmd
-cmake -B build_x64 -A x64
-cmake --build build_x64 --config Release
-```
+构建结果位于 `build\bin\`，其中包含可直接运行的 `aidbg.exe` 和 `TitanEngine.dll`。
+已有 clone 可运行 `git submodule update --init --recursive` 初始化依赖。
 
 ## AI 使用示例
 

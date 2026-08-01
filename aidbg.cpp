@@ -73,6 +73,7 @@ __declspec(dllimport) void     TITCALL DebugLoop();
 __declspec(dllimport) void     TITCALL ForceClose();
 __declspec(dllimport) bool     TITCALL StopDebug();
 __declspec(dllimport) void     TITCALL SetCustomHandler(DWORD id, void* cb);
+__declspec(dllimport) void     TITCALL SetNextDbgContinueStatus(DWORD status);
 __declspec(dllimport) bool     TITCALL SetBPX(ULONG_PTR a, DWORD type, void* cb);
 __declspec(dllimport) bool     TITCALL DeleteBPX(ULONG_PTR a);
 __declspec(dllimport) bool     TITCALL EnableBPX(ULONG_PTR a);
@@ -186,6 +187,7 @@ static std::thread g_loop_thread;
 
 static DWORD g_exception_code = 0;          // last exception info
 static ULONG_PTR g_exception_addr = 0;
+static bool g_handle_exception_on_resume = false; // selected by the active stop callback
 
 static std::vector<std::string> g_events;   // event log
 static std::mutex g_ev_mu;
@@ -370,17 +372,31 @@ static void set_target_path(const std::string& path)
 
 // Runs on the DebugLoop thread. Pauses the target and blocks until the REPL
 // thread issues continue/step.
-static void pause_until_continue(const char* reason)
+static void pause_until_continue(const char* reason, bool handle_exception_on_resume = false)
 {
     std::unique_lock<std::mutex> lk(g_mu);
     if (g_quit) return;
     g_reason = reason ? reason : "stop";
+    g_handle_exception_on_resume = handle_exception_on_resume;
     g_stopped = true;
     g_waiting = true;
     ThreaderPauseAllThreads(false);
     g_cv.notify_all();
     g_cv.wait(lk, []{ return !g_waiting || g_quit; });
     ThreaderResumeAllThreads(false);
+}
+
+// Resume a callback blocked in pause_until_continue(). TitanEngine defaults
+// debuggee-generated exceptions to DBG_EXCEPTION_NOT_HANDLED. The callback
+// that classified the event may explicitly choose debugger handling instead.
+static void resume_waiting_callback()
+{
+    std::lock_guard<std::mutex> lk(g_mu);
+    if (g_handle_exception_on_resume)
+        SetNextDbgContinueStatus(DBG_CONTINUE);
+    g_handle_exception_on_resume = false;
+    g_waiting = false;
+    g_cv.notify_all();
 }
 
 // exit-process handler: do NOT block (DebugLoop must be able to finish)
@@ -396,7 +412,6 @@ static void __cdecl cb_exit(void*)
 
 // stop handlers (TitanEngine calls them with one arg: &DBGEvent / exception record)
 static void __cdecl cb_system_bp(void*) { pause_until_continue("initial-break"); }
-static void __cdecl cb_program_bp(void*) { g_exception_code=STATUS_BREAKPOINT; g_hit_bp_id=0; pause_until_continue("breakpoint"); }
 static void __cdecl cb_single_step(void*) { pause_until_continue("single-step"); }
 static void __cdecl cb_access_violation(void*)
 {
@@ -412,11 +427,25 @@ static void __cdecl cb_access_violation(void*)
 static void __cdecl cb_exception_stop(void*)
 {
     auto* de = (DEBUG_EVENT*)GetDebugData();
+    bool is_int3 = false;
     if (de && de->dwDebugEventCode == EXCEPTION_DEBUG_EVENT) {
         g_exception_code = de->u.Exception.ExceptionRecord.ExceptionCode;
         g_exception_addr = (ULONG_PTR)de->u.Exception.ExceptionRecord.ExceptionAddress;
+
+        // Breakpoint disposition is debugger policy, not an engine heuristic.
+        // Preserve TitanEngine's NOT_HANDLED default for RaiseException and
+        // other exceptions, but make `continue` consume an executed short int3.
+        if (g_exception_code == STATUS_BREAKPOINT) {
+            g_hit_bp_id = 0;
+            PROCESS_INFORMATION* pi = TitanGetProcessInformation();
+            unsigned char opcode = 0;
+            is_int3 = pi && MemoryReadSafe(pi->hProcess,
+                                           (void*)g_exception_addr,
+                                           &opcode, sizeof(opcode), nullptr) &&
+                      opcode == 0xCC;
+        }
     }
-    pause_until_continue("exception");
+    pause_until_continue(is_int3 ? "breakpoint" : "exception", is_int3);
 }
 
 // our own breakpoint / step callbacks (TitanEngine calls no-arg ones)
@@ -524,7 +553,9 @@ static void __cdecl cb_log_event(void*)
 static void register_handlers()
 {
     SetCustomHandler(UE_CH_SYSTEMBREAKPOINT, (void*)&cb_system_bp);
-    SetCustomHandler(UE_CH_BREAKPOINT,       (void*)&cb_program_bp);
+    // Leave UE_CH_BREAKPOINT unset. Stray STATUS_BREAKPOINT events flow through
+    // UE_CH_UNHANDLEDEXCEPTION, where aidbg can choose the continue disposition
+    // without changing TitanEngine's transparent default.
     SetCustomHandler(UE_CH_SINGLESTEP,       (void*)&cb_single_step);
     SetCustomHandler(UE_CH_ACCESSVIOLATION,  (void*)&cb_access_violation);
     SetCustomHandler(UE_CH_ILLEGALINSTRUCTION, (void*)&cb_exception_stop);
@@ -608,6 +639,7 @@ static void reset_state()
     std::lock_guard<std::mutex> lk(g_mu);
     g_stopped = false; g_waiting = false; g_exited = false; g_quit = false;
     g_reason.clear(); g_exception_code = 0; g_exception_addr = 0;
+    g_handle_exception_on_resume = false;
     g_running = false;
     g_hit_bp_id = 0; g_hit_bp_hits = 0; g_cond_failed = false;
     g_hit_bp_oneshot = false;
@@ -1892,11 +1924,7 @@ static CmdResult cmd_continue()
     if (g_json) printf("{\"type\":\"running\"}\n"); else if (!g_silent) printf("Continuing.\n");
     fflush(stdout);
     ctx_reset();
-    {
-        std::lock_guard<std::mutex> lk(g_mu);
-        g_waiting = false;
-        g_cv.notify_all();
-    }
+    resume_waiting_callback();
     std::string reason = wait_stop_consume();
     if (reason == "exited") {
         if (g_json) printf("{\"type\":\"exited\",\"code\":%ld}\n", GetExitCode());
@@ -1944,11 +1972,7 @@ static CmdResult cmd_step(const char* kind, int n)
         if (strcmp(kind, "into") == 0) StepInto((void*)&cb_step);
         else if (strcmp(kind, "over") == 0) StepOver((void*)&cb_step);
         else StepOut((void*)&cb_step, false);
-        {
-            std::lock_guard<std::mutex> lk(g_mu);
-            g_waiting = false;
-            g_cv.notify_all();
-        }
+        resume_waiting_callback();
         reason = wait_stop_consume();
         if (reason == "exited") break;
         if (reason == "ended") break;
@@ -1960,11 +1984,7 @@ static CmdResult cmd_step(const char* kind, int n)
             if (sym_func_name(reg_get(UE_CIP)) != start_func) break;
             ctx_reset();
             StepInto((void*)&cb_step);
-            {
-                std::lock_guard<std::mutex> lk(g_mu);
-                g_waiting = false;
-                g_cv.notify_all();
-            }
+            resume_waiting_callback();
             reason = wait_stop_consume();
         }
     }

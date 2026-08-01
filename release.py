@@ -20,18 +20,18 @@ repo root (or anywhere; the script locates itself).
 import argparse
 import datetime
 import os
+import shutil
 import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 AIDBG_CPP = os.path.join(HERE, "aidbg.cpp")
 AIDBG_EXE = os.path.join(HERE, "aidbg.exe")
+TITAN_DLL = os.path.join(HERE, "TitanEngine.dll")
+BUILD_DIR = os.path.join(HERE, "build")
+BUILD_BIN = os.path.join(BUILD_DIR, "bin")
 TEST_BUILD = os.path.join(HERE, "tests", "build.cmd")
 TEST_RUN = os.path.join(HERE, "tests", "run_tests.py")
-
-# build flags documented at the top of aidbg.cpp
-CL_FLAGS = ["/nologo", "/EHsc", "/std:c++17", "/O2", "/utf-8"]
-
 
 def log(msg):
     print("[release] %s" % msg)
@@ -77,32 +77,45 @@ def find_vcvars():
     return None
 
 
-def build_aidbg(vcvars):
-    log("building aidbg.exe ...")
-    titan_lib = os.path.join(os.environ.get("USERPROFILE", os.path.expanduser("~")),
-                             "TitanEngine", "build_x64", "Release")
-    # write a temp .cmd so cmd.exe does not mangle the quotes in `cmd /c "..."`
-    build_cmd = os.path.join(HERE, "_build_aidbg.cmd")
+def build_aidbg():
+    log("initializing TitanEngine submodule ...")
+    rc, out = run(["git", "submodule", "update", "--init", "--recursive"])
+    if rc != 0:
+        fail("git submodule update failed\n" + out[-2000:])
+
+    log("configuring CMake ...")
+    rc, out = run(["cmake", "-S", HERE, "-B", BUILD_DIR, "-A", "x64"])
+    if rc != 0:
+        fail("CMake configure failed\n" + out[-2000:])
+
+    log("building aidbg.exe and TitanEngine.dll ...")
+    rc, out = run(["cmake", "--build", BUILD_DIR, "--config", "Release"], timeout=1200)
+    if rc != 0:
+        fail("CMake build failed\n" + out[-2000:])
+
+    for name, destination in (("aidbg.exe", AIDBG_EXE),
+                              ("TitanEngine.dll", TITAN_DLL)):
+        source = os.path.join(BUILD_BIN, name)
+        if not os.path.isfile(source):
+            fail("CMake output missing: %s" % source)
+        shutil.copy2(source, destination)
+    log("aidbg.exe and TitanEngine.dll built")
+
+
+def build_tests(vcvars):
+    log("building test targets ...")
+    build_cmd = os.path.join(HERE, "_build_tests.cmd")
     with open(build_cmd, "w", encoding="utf-8") as f:
         f.write('@echo off\r\n')
         f.write('call "%s" >nul 2>&1\r\n' % vcvars)
-        f.write('cl %s "%s" /Fe:"%s" /Fo:"%s.obj" /link /LIBPATH:"%s" TitanEngine.lib\r\n'
-                % (" ".join(CL_FLAGS), AIDBG_CPP, AIDBG_EXE, AIDBG_EXE, titan_lib))
+        f.write('call "%s"\r\n' % TEST_BUILD)
     try:
-        rc, out = run(["cmd", "/c", build_cmd])
+        rc, out = run(["cmd", "/c", build_cmd], timeout=600)
         if rc != 0:
-            fail("cl failed\n" + out[-2000:])
+            fail("tests/build.cmd failed\n" + out[-2000:])
     finally:
         if os.path.exists(build_cmd):
             os.unlink(build_cmd)
-    log("aidbg.exe built")
-
-
-def build_tests():
-    log("building test targets ...")
-    rc, out = run(["cmd", "/c", TEST_BUILD], timeout=600)
-    if rc != 0:
-        fail("tests/build.cmd failed\n" + out[-2000:])
 
 
 def run_tests():
@@ -158,8 +171,8 @@ def main():
         vcvars = find_vcvars()
         if not vcvars:
             fail("vcvars64.bat not found; install VS2022 or set the path in release.py")
-        build_aidbg(vcvars)
-        build_tests()
+        build_aidbg()
+        build_tests(vcvars)
     else:
         log("--skip-build: using existing aidbg.exe")
 

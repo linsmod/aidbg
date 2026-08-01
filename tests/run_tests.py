@@ -324,48 +324,53 @@ def case_source_checksum():
 
 
 def case_debugbreak():
-    """Case 4.15 - program-generated DebugBreak()/int 3.
+    """Case 4.15 - breakpoint disposition belongs to aidbg, not TitanEngine.
 
-    A program with DebugBreak() in the middle writes dbgbrk_before.flag and
-    dbgbrk_after.flag into its working directory. With the TitanEngine fix the
-    stray int 3 is consumed (DBG_CONTINUE, like VS): aidbg stops ONCE at the
-    int 3 and `continue` resumes past it, so the after-flag must exist and the
-    process must exit cleanly. A regression (double-stop / NOT_HANDLED) leaves
-    the process stuck or crashing and the after-flag missing.
+    `continue` consumes an executed short int3 so DebugBreak resumes normally.
+    RaiseException(STATUS_BREAKPOINT) remains NOT_HANDLED and reaches the
+    debuggee's SEH handler. Both scenarios must stop only once after `start`.
     """
     results = []
     exe = os.path.join(ROOT, "test_debugbreak.exe")
-    before = os.path.join(ROOT, "dbgbrk_before.flag")
-    after = os.path.join(ROOT, "dbgbrk_after.flag")
-
     script = os.path.join(HERE, "_case_4_15_dbgbrk.txt")
-    with open(script, "w", encoding="utf-8") as f:
-        f.write("\n".join([
-            "file %s" % exe,
-            "start",
-            "continue",
-            "continue",
-            "quit",
-        ]) + "\n")
-    try:
+    flags = [
+        "dbgbrk_before.flag", "dbgbrk_after.flag",
+        "raise_before.flag", "raise_handler.flag", "raise_after.flag",
+    ]
+
+    def run_scenario(commands):
+        with open(script, "w", encoding="utf-8") as f:
+            f.write("\n".join(["file %s" % exe] + commands + ["quit"]) + "\n")
         p = subprocess.run([AIDBG, "--batch", "-ex", "set engine console on",
                             "-x", script], cwd=ROOT,
                            capture_output=True, text=True, timeout=90,
                            encoding="utf-8", errors="replace",
                            creationflags=CREATE_NO_WINDOW)
-        out = p.stdout + p.stderr
-        stops = out.count("Stopped:")
+        return p.stdout + p.stderr
+
+    try:
+        out = run_scenario(["start", "continue", "continue"])
         results.append(("program ran before DebugBreak",
-                        os.path.exists(before), out))
-        results.append(("single stop at the int 3 (no double-stop)",
-                        stops <= 2, out))
+                        os.path.exists(os.path.join(ROOT, "dbgbrk_before.flag")), out))
+        results.append(("single stop at the int 3 (no duplicate callback)",
+                        out.count("Stopped:") == 2 and "Stopped: breakpoint" in out, out))
         results.append(("resumed past DebugBreak (after flag written)",
-                        os.path.exists(after), out))
+                        os.path.exists(os.path.join(ROOT, "dbgbrk_after.flag")), out))
+
+        out = run_scenario(["set args raise", "start", "continue", "continue"])
+        results.append(("RaiseException stops as an exception",
+                        out.count("Stopped:") == 2 and "exception 0x80000003" in out, out))
+        results.append(("RaiseException reaches the debuggee SEH handler",
+                        os.path.exists(os.path.join(ROOT, "raise_handler.flag")), out))
+        results.append(("debuggee resumes after handling RaiseException",
+                        os.path.exists(os.path.join(ROOT, "raise_after.flag")), out))
     finally:
-        os.unlink(script)
-        for f in (before, after):
-            if os.path.exists(f):
-                os.unlink(f)
+        if os.path.exists(script):
+            os.unlink(script)
+        for name in flags:
+            path = os.path.join(ROOT, name)
+            if os.path.exists(path):
+                os.unlink(path)
     return results
 
 
@@ -484,7 +489,7 @@ CASES = [
     },
     {
         "id": "4.15",
-        "name": "DebugBreak() continuation (TitanEngine fix)",
+        "name": "breakpoint continuation policy",
         "script": None,
         "expect": None,
         "dynamic": "debugbreak",

@@ -170,31 +170,27 @@
 - `list` 的 JSON 输出已从数组改为 `{"lines":[...]}`（新增可选 `"checksum"` 字段），
   schema 变化请以 4.14 用例为准。
 
-## G. 程序自身 int3 / DebugBreak()（**已修复**，TitanEngine fork）
+## G. 程序自身 int3 / DebugBreak()（**已修复**，aidbg continue 策略）
 
-**现象（修复前实测）**：`DebugBreak()` / `__debugbreak()`（程序生成的 `int 3`）在 aidbg
-下不能正确工作：首轮停止被误报为 `breakpoint`，继续后停为 `exception 0x80000003`
-（第二次机会），地址振荡、多次 continue；最终进程以 `0x80000003` 退出或 SEH 处理器
-不执行。`After DebugBreak` 永不打印。
+**现象**：`DebugBreak()` / `__debugbreak()` 触发的游离 `int3` 停止后，aidbg 的
+`continue` 仅解除回调等待，没有选择该异常的继续状态。TitanEngine 按设计保留
+`DBG_EXCEPTION_NOT_HANDLED`，随后 aidbg 又通过 `UE_CH_UNHANDLEDEXCEPTION` 对同一事件
+停止一次；无 SEH 的目标最终收到二次机会异常。
 
-**根因（TitanEngine `DebugLoop.cpp`）**：游离 int3（不在断点表）被置
-`DBGCode = DBG_EXCEPTION_NOT_HANDLED` 并回调 `chBreakPoint`（aidbg `cb_program_bp`）。
-NOT_HANDLED 使异常穿透到被调试程序 → 无 SEH 则二次机会崩溃、有 SEH 则被拦截执行，
-均非调试器对 DebugBreak 的预期行为。
+**根因**：异常由调试器消费还是交给被调试程序属于调试器前端策略。TitanEngine 的
+默认值必须是 `DBG_EXCEPTION_NOT_HANDLED`，否则程序可通过 `int3` + SEH/VEH 处理器是否
+执行来检测调试器。上游因此关闭了
+[x64dbg/TitanEngine#36](https://github.com/x64dbg/TitanEngine/issues/36) 和
+[x64dbg/TitanEngine#37](https://github.com/x64dbg/TitanEngine/pull/37)。相关的
+[x64dbg/TitanEngine#32](https://github.com/x64dbg/TitanEngine/pull/32) /
+[#33](https://github.com/x64dbg/TitanEngine/issues/33) 修复的是单步临时断点清理，问题不同。
 
-**修复（改 TitanEngine fork，`TitanEngine.Debugger.DebugLoop.cpp` 游离 int3 分支）**：
-先读 `ExceptionAddress` 处字节判别——**真实单字节 `int 3`（0xCC）**才 `DBG_CONTINUE`
-（同 VS；单字节 int3 触发异常时 CPU 已把 RIP 指到其后的指令，无需写寄存器，寄存器
-回卷 `Rip -= BreakPointSize` 仅用于调试器自设断点，见 DebugLoop.cpp:556）；**其余
-情况（如 `RaiseException(0x80000003)`）保持 `DBG_EXCEPTION_NOT_HANDLED` 原语义**，
-因此对其他异常处理功能无影响（实测 `RaiseException`+`__except` 行为与修复前一致）。
+**修复**：aidbg 不再注册 `UE_CH_BREAKPOINT`，而是在 `UE_CH_UNHANDLEDEXCEPTION` 中读取
+`ExceptionAddress` 处的 opcode。真实短 `int3`（`0xCC`）仍显示为 `breakpoint`；用户执行
+`continue` 或单步时，aidbg 显式调用 `SetNextDbgContinueStatus(DBG_CONTINUE)`。由
+`RaiseException(STATUS_BREAKPOINT)` 产生的事件没有 `0xCC`，继续保持
+`DBG_EXCEPTION_NOT_HANDLED` 并进入被调试程序的 SEH。
 
-**修复后实测**：
-- `DebugBreak()` / `__debugbreak()` / 带 SEH 处理器三种场景均**只停一次**（报
-  `breakpoint`，地址 `DebugBreak+0x3`），`continue` 后程序越过 int3 正常跑完、退出码 0；
-- 用例 4.15（`test_debugbreak.exe` 写 before/after 标记文件）验证：单停 + after 标记
-  存在 + 无回归；全套 21 项通过。
-- **注意**：`DBG_CONTINUE` 会消费异常，程序自身的 `__try/__except(STATUS_BREAKPOINT)`
-  处理器在调试器下不会执行（与 VS 一致）；停止原因仍显示为 `breakpoint`（待美化，
-  可改为 `exception 0x80000003` 更准确）。
-- **依赖**：需要随发行版一起替换 `TitanEngine.dll`（本仓库已跟踪该二进制）。
+用例 4.15 同时验证 `DebugBreak()` 正常续跑、没有重复停止，以及
+`RaiseException(STATUS_BREAKPOINT)` 的 SEH 处理器仍执行。TitanEngine 以与 x64dbg 相同的
+官方 submodule revision 构建；仓库不再携带预编译 DLL 或私有异常语义补丁。

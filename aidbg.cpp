@@ -3080,6 +3080,7 @@ static CmdResult cmd_x(const std::string& arg)
     int count = 1;
     char fmt = 'x';
     char size = 'w';
+    bool size_given = false;
     std::string addr_str = a;
     if (!a.empty() && a[0] == '/') {
         size_t slash = a.find(' ');
@@ -3088,7 +3089,7 @@ static CmdResult cmd_x(const std::string& arg)
         std::string digits;
         for (char c : spec) {
             if (isdigit((unsigned char)c) || (c == '-' && digits.empty())) digits += c;
-            else if (strchr("bhwg", c)) size = c;           // b=byte h=half w=word g=giant
+            else if (strchr("bhwg", c)) { size = c; size_given = true; } // b=byte h=half w=word g=giant
             else if (strchr("xduotacsfi", c)) fmt = c;      // GDB x/d/u/o/t/a/c/s/f/i
         }
         if (!digits.empty()) count = atoi(digits.c_str());
@@ -3111,6 +3112,36 @@ static CmdResult cmd_x(const std::string& arg)
         CmdResult cr;
         cr.js = disasm_json(ins);
         cr.text = disasm_text(ins);
+        return cr;
+    }
+
+    if (fmt == 's') {
+        // GDB: 's' prints NUL-terminated string(s); the unit size selects the
+        // char width (defaults to b; h = 16-bit, w = 32-bit, as in x/hs / x/ws).
+        int cw = size_given ? (size == 'h' ? 2 : size == 'w' ? 4 : 1) : 1;
+        size_t total = 4096;
+        std::vector<unsigned char> sbuf(total);
+        SIZE_T nr = 0;
+        if (!mem_read(addr, sbuf.data(), total, &nr)) return {false, "memory read failed"};
+        std::string s;
+        size_t k = 0;
+        for (int shown = 0; shown < (count < 0 ? -count : count) && k + cw <= nr; shown++) {
+            std::string piece;
+            while (k + cw <= nr && piece.size() < 512) {
+                uint64_t cp = 0; bool term = true;
+                for (int j = 0; j < cw; j++) {
+                    uint8_t b = sbuf[k + j]; cp |= (uint64_t)b << (8 * j); if (b) term = false;
+                }
+                k += cw;
+                if (term) break;
+                piece += (cp >= 32 && cp < 127) ? (char)cp : '.';
+            }
+            if (!s.empty()) s += " ";
+            s += piece;
+        }
+        CmdResult cr;
+        cr.js = "{\"address\":\"" + hex(addr) + "\",\"string\":\"" + js_str(s) + "\"}";
+        cr.text = hex(addr) + ": \"" + s + "\"";
         return cr;
     }
 
@@ -3166,16 +3197,6 @@ static CmdResult cmd_x(const std::string& arg)
         t << fmt_unit(v) << " ";
         if ((i + bytes_per) % 16 == 0) t << "\n";
         i += bytes_per;
-    }
-    if (fmt == 's') {
-        // ascii string
-        std::string s;
-        for (size_t k = 0; k < nr && buf[k] != 0 && k < 512; k++)
-            s += (buf[k] >= 32 && buf[k] < 127) ? (char)buf[k] : '.';
-        CmdResult cr;
-        cr.js = "{\"address\":\"" + hex(addr) + "\",\"string\":\"" + js_str(s) + "\"}";
-        cr.text = hex(addr) + ": \"" + s + "\"";
-        return cr;
     }
     j << "]";
     CmdResult cr;

@@ -1,0 +1,12 @@
+# Case 4.31 - examine string formats: x/s (8-bit), x/hs (UTF-16), x/ws (UTF-32)
+# Target: test_string.exe
+# GDB: 's' prints NUL-terminated string(s); the unit size selects the char
+# width (default b; h = 16-bit, w = 32-bit). `x/s` on a wide string stops at
+# the first NUL high byte (shows "H"), which is why `x/hs` is needed for
+# UTF-16 strings. Symbols resolve to fixed addresses (/DYNAMICBASE:NO).
+file test_string.exe
+start
+x/s g_ascii
+x/hs g_wide
+x/s g_wide
+quit

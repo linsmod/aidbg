@@ -41,7 +41,7 @@ PYTHON = sys.executable
 
 TARGETS = ["test_basic", "test_memory", "test_exception", "test_threads",
            "test_symbols", "test_attach", "test_checksum", "test_debugbreak",
-           "test_source_step", "test_vars"]
+           "test_source_step", "test_vars", "test_string"]
 
 # x86 (WoW64) targets are built with a separate script; aidbg (x64) debugs them
 # cross-architecture, which exercises the STATUS_WX86_BREAKPOINT path.
@@ -782,6 +782,12 @@ CASES = [
         "script": None,
         "expect": None,
         "dynamic": "addrexpr",
+    },
+    {
+        "id": "4.31",
+        "name": "examine strings: x/s ascii, x/hs UTF-16",
+        "script": "case_4_31_strings.txt",
+        "expect": ["\"Hello, aidbg!\"", "\"Hello, wide aidbg!\"", ": \"H\""],
     },
 ]
 

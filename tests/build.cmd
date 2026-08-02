@@ -31,7 +31,7 @@ set "LDFLAGS=/DEBUG:FULL /DYNAMICBASE:NO"
 rem Rebuild "clean" first so stale PDBs never mask symbol bugs.
 rem (Per-target build below only recompiles when the source changed.)
 
-set "TARGETS=test_basic test_memory test_exception test_threads test_symbols test_attach test_checksum test_debugbreak test_source_step test_vars"
+set "TARGETS=test_basic test_memory test_exception test_threads test_symbols test_attach test_checksum test_debugbreak test_source_step test_vars test_string"
 if not "%~1"=="" set "TARGETS=%~1"
 
 for %%t in (%TARGETS%) do (

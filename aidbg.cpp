@@ -1417,6 +1417,7 @@ static bool eval_expr(const std::string& expr, unsigned long long& out)
         const std::string& s;
         size_t p = 0;
         bool ok = true;
+        bool addr_mode = false;
         explicit P(const std::string& str) : s(str) {}
         void skip() { while (p < s.size() && (s[p]==' '||s[p]=='\t')) p++; }
         bool fail() { ok = false; return false; }
@@ -1500,6 +1501,7 @@ static bool eval_expr(const std::string& expr, unsigned long long& out)
             if (s[p]=='-') { p++; unsigned long long r; if(!parse_unary(r)) return false; v = (unsigned long long)(-(long long)r); return true; }
             if (s[p]=='+') { p++; return parse_unary(v); }
             if (s[p]=='*') { p++; unsigned long long r; if(!parse_unary(r)) return false; SIZE_T n = sizeof(ULONG_PTR), nr = 0; if(!mem_read((ULONG_PTR)r, &v, n, &nr) || nr < n) return fail(); return true; }
+            if (s[p]=='&') { p++; bool save = addr_mode; addr_mode = true; unsigned long long r; if(!parse_unary(r)) { addr_mode = save; return false; } addr_mode = save; v = r; return true; }
             return parse_primary(v);
         }
         bool parse_primary(unsigned long long& v) {
@@ -1531,12 +1533,12 @@ static bool eval_expr(const std::string& expr, unsigned long long& out)
                 CONTEXT c;
                 unsigned long long lv = 0; ULONG_PTR la = 0; DWORD lsz = 0;
                 if (ctx_display(c) && local_lookup(name, c, target_is64(), lv, la, lsz)) {
-                    v = lv; return true;
+                    v = addr_mode ? (la ? (ULONG_PTR)la : lv) : lv; return true;
                 }
                 // global symbol: function -> its address, data -> its value
                 ULONG_PTR addr = 0;
                 if (!sym_lookup(name, addr)) return fail();
-                if (addr_is_code(addr)) { v = addr; return true; }
+                if (addr_mode || addr_is_code(addr)) { v = addr; return true; }
                 SIZE_T n = sizeof(ULONG_PTR), nr = 0;
                 if (!mem_read(addr, &v, n, &nr) || nr < n) return fail();
                 return true;

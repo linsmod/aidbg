@@ -32,7 +32,7 @@ endif()
 set(TITANENGINE_RESOURCES ON CACHE BOOL "Build TitanEngine resources" FORCE)
 add_subdirectory(third_party/TitanEngine)
 
-add_executable(aidbg aidbg.cpp)
+add_executable(aidbg aidbg.cpp aidbg.rc)
 target_compile_features(aidbg PRIVATE cxx_std_17)
 target_link_libraries(aidbg PRIVATE TitanEngine)
 

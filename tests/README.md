@@ -89,11 +89,13 @@ cl /nologo /Zi /Od /Oy- /GS- /MTd /Fe:<target>.exe <target>.c /link /DEBUG:FULL 
 | 4.27 | `case_4_27_condition_local.txt` | `condition` 用局部变量 | `condition 2 local_x2 == 6`（level1(3)）停到 `level1` |
 | 4.28 | `case_4_28_set_local.txt` | `set` 局部变量 + 表达式右侧 | `set local_sum = 50`、`set local_prod = local_sum + 5`（55） |
 | 4.29 | `case_4_29_frame.txt` | `frame N` 帧导航 + 按帧 `info locals` | `frame 1`→level1 的 `local_x2=6`；`frame 2`→main 的 `v` |
+| 4.30 | `case_4_30_addr_expr.txt` | 地址表达式 + GDB `x/Nfu` 格式（handover8） | `print &g_vtick`→`0x14011a280`；`x/8h`→半字值 `0x8348 0x38ec`；`u/d/t/o/c` 格式（`33608`、`-31928`、二进制、八进制、`72 'H'`）；`x/-2h` 反向查看；`x/4i`→反汇编 `SUB RSP`；坏寄存器→`error: bad address`（exit 1） |
+| 4.30b | （运行器动态驱动） | `&` 取址往返 + `$reg±offset` 转储地址 | 解析输出地址验证 `*(&local_sum)==local_sum`、`$rsp-0x10`/`$rsp+0x10` 恰好偏移 0x10、`x/Nh` 输出单位值而非反汇编 |
 
 > **断点编号**：`start` 的一次性入口断点占用 id 1（GDB 一致），因此 4.2/4.2b 的
 > `break func1` 为 id 2、4.9 的 `break add` 为 id 2，脚本与断言均已按此编号。
 
-### 用例 4.7b / 4.8 / 4.10b（动态用例）
+### 用例 4.7b / 4.8 / 4.10b / 4.30b（动态用例）
 
 这三个场景的值（线程 id、PID、搜索命中地址）在每次运行都不同，无法写死在脚本里，
 因此由 `run_tests.py` 在运行时动态驱动：
@@ -116,6 +118,12 @@ cl /nologo /Zi /Od /Oy- /GS- /MTd /Fe:<target>.exe <target>.c /link /DEBUG:FULL 
   `continue` 正常推进、`stepi` 可单步。
 - **4.22**：动态调用三次 `aidbg --batch`，断言 man page 的 OPTIONS 语义——成功脚本
   退出码 0、命令出错退出码非 0、`-e <file>`（`--exec`）选中目标并运行（退出码 42）。
+- **4.30b**：栈地址每次运行不同，无法写死在脚本里，故解析单次会话输出：断言
+  `print &local_sum` 得到地址 A 且 `*(&local_sum)` 低 32 位等于 `local_sum` 的值
+  （`&` 取址往返）；`x/4h $rsp-0x10`/`$rsp+0x10` 的 dump 地址恰好比 `$rsp` 低/高
+  0x10（回归：以前解析失败会静默回退到 rip）；`x/4h` 在固定地址输出 GDB 风格
+  半字值 `0x8348 0x38ec` 而 `x/4i` 输出 `SUB RSP`（区分转储与反汇编）；坏寄存器报
+  `bad address`。
 
 ## 与 TestGuid.md 的差异说明（实现现实）
 

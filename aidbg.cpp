@@ -1916,9 +1916,14 @@ static bool parse_addr(const std::string& tok, ULONG_PTR& out)
         return false;
     }
     if (t.size() > 1 && t[0] == '$') {
-        DWORD idx = reg_index_for_name(t.substr(1), is64);
+        size_t op = t.find_first_of("+-", 1);
+        std::string rn = op == std::string::npos ? t.substr(1) : t.substr(1, op - 1);
+        DWORD idx = reg_index_for_name(rn, is64);
         if (!idx) return false;
-        out = reg_get(idx);
+        if (op == std::string::npos) { out = reg_get(idx); return true; }
+        ULONG_PTR b = 0;
+        if (!parse_addr(t.substr(op + 1), b)) return false;
+        out = (t[op] == '+') ? reg_get(idx) + b : reg_get(idx) - b;
         return true;
     }
     // strip optional '+' expression "addr+0x10"
@@ -1927,6 +1932,16 @@ static bool parse_addr(const std::string& tok, ULONG_PTR& out)
         ULONG_PTR a = 0, b = 0;
         if (parse_addr(t.substr(0, plus), a) && parse_addr(t.substr(plus + 1), b)) {
             out = a + b;
+            return true;
+        }
+        return false;
+    }
+    // strip optional '-' expression "addr-0x240"
+    size_t minus = t.find('-');
+    if (minus != std::string::npos) {
+        ULONG_PTR a = 0, b = 0;
+        if (parse_addr(t.substr(0, minus), a) && parse_addr(t.substr(minus + 1), b)) {
+            out = a - b;
             return true;
         }
         return false;
@@ -3062,9 +3077,9 @@ static CmdResult cmd_x(const std::string& arg)
 {
     if (!require_running()) return {false, "no active debug session"};
     std::string a = arg;
-    int count = 8;
+    int count = 1;
     char fmt = 'x';
-    char size = 'g';
+    char size = 'w';
     std::string addr_str = a;
     if (!a.empty() && a[0] == '/') {
         size_t slash = a.find(' ');
@@ -3072,17 +3087,23 @@ static CmdResult cmd_x(const std::string& arg)
         addr_str = slash == std::string::npos ? "" : a.substr(slash + 1);
         std::string digits;
         for (char c : spec) {
-            if (isdigit((unsigned char)c)) digits += c;
-            else if (strchr("bhdwg", c)) size = c;          // b=byte h=half w=word g=giant
-            else if (strchr("xduicsfi", c)) fmt = c;        // 'i' = instruction disassembly
-            else if (strchr("o", c)) fmt = 'o';
+            if (isdigit((unsigned char)c) || (c == '-' && digits.empty())) digits += c;
+            else if (strchr("bhwg", c)) size = c;           // b=byte h=half w=word g=giant
+            else if (strchr("xduotacsfi", c)) fmt = c;      // GDB x/d/u/o/t/a/c/s/f/i
         }
         if (!digits.empty()) count = atoi(digits.c_str());
         if (!target_is64() && size == 'g') size = 'w';
+        // GDB: negative repeat count examines memory backward from addr, but
+        // for 'i'/'s' that requires backward disassembly/string scan we do not
+        // implement, so reject those combinations explicitly.
+        if (count < 0 && (fmt == 'i' || fmt == 's'))
+            return {false, "negative repeat count not supported for format '" + std::string(1, fmt) + "'"};
     }
     ULONG_PTR addr = 0;
-    if (addr_str.empty() || !parse_addr(addr_str, addr)) {
+    if (addr_str.empty()) {
         addr = reg_get(UE_CIP);
+    } else if (!parse_addr(addr_str, addr)) {
+        return {false, "bad address: " + addr_str};
     }
 
     if (fmt == 'i') {
@@ -3097,16 +3118,42 @@ static CmdResult cmd_x(const std::string& arg)
     if (size == 'b') bytes_per = 1; else if (size == 'h') bytes_per = 2;
     else if (size == 'w') bytes_per = 4; else if (size == 'g') bytes_per = 8;
 
-    size_t total = (size_t)count * bytes_per;
+    // negative repeat count: examine memory backward from addr (GDB x/-Nuh)
+    int units = count < 0 ? -count : count;
+    if (count < 0) addr -= (ULONG_PTR)(units * bytes_per);
+    size_t total = (size_t)units * bytes_per;
     if (total > 4096) total = 4096;
     std::vector<unsigned char> buf(total);
     SIZE_T nr = 0;
     if (!mem_read(addr, buf.data(), total, &nr)) return {false, "memory read failed"};
 
+    // format one memory unit the way GDB does: x = hex, d = signed decimal,
+    // u = unsigned decimal, o = octal, t = binary, c = char (default x).
+    auto fmt_unit = [&](uint64_t v) -> std::string {
+        std::ostringstream s;
+        switch (fmt) {
+        case 'd': {
+            int bits = bytes_per * 8;
+            long long sv = bits < 64 ? ((long long)(v << (64 - bits)) >> (64 - bits))
+                                     : (long long)v;
+            s << sv; break;
+        }
+        case 'u': s << (unsigned long long)v; break;
+        case 'o': s << "0" << std::oct << v; break;
+        case 't':
+            for (int k = bytes_per * 8 - 1; k >= 0; k--) s << (((v >> k) & 1) ? '1' : '0');
+            break;
+        case 'c': s << (int)(unsigned char)v << " '" << (char)(unsigned char)v << "'"; break;
+        default:  // 'x' (and 'a' approximated as hex)
+            s << "0x" << std::setw(2 * bytes_per) << std::setfill('0') << std::hex << v;
+            break;
+        }
+        return s.str();
+    };
+
     std::ostringstream j;
     j << "[";
     std::ostringstream t;
-    t << std::uppercase << std::hex;
     size_t i = 0;
     bool first = true;
     while (i + bytes_per <= nr) {
@@ -3116,7 +3163,7 @@ static CmdResult cmd_x(const std::string& arg)
         first = false;
         j << "{\"address\":\"" << hex(addr + i) << "\",\"value\":\"" << hex_brief(v) << "\"}";
         if (i % 16 == 0) t << hex(addr + i) << ":  ";
-        for (int k = 0; k < bytes_per; k++) t << std::setw(2) << std::setfill('0') << (int)buf[i + k] << " ";
+        t << fmt_unit(v) << " ";
         if ((i + bytes_per) % 16 == 0) t << "\n";
         i += bytes_per;
     }

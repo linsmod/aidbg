@@ -1,0 +1,28 @@
+# Case 4.30 - address-of (&) expressions and examine formats (handover8)
+# Target: test_vars.exe
+# `print &x` returns the variable's address: local -> stack, global -> image.
+# `x/Nfu` follows GDB: unit-sized hex VALUES by default (0x8348 0x38ec ...),
+# 16 bytes per line; `i` is the only disassembly form; d/u/o/t/c change the
+# format; a negative repeat count examines memory backward from addr.
+# `$reg-0xNN` / `$reg+0xNN` parse as address expressions; a bad register errors
+# instead of silently falling back to the instruction pointer.
+file test_vars.exe
+start
+break 21
+continue
+print local_sum
+print &local_sum
+print &g_vtick
+x/8h 0x1400076c0
+x/2uh 0x1400076c0
+x/2dh 0x1400076c0
+x/2th 0x1400076c0
+x/2oh 0x1400076c0
+x/2ch 0x1400076c0
+x/-2h 0x1400076c6
+x/4i 0x1400076c0
+x/4h $rsp
+x/4h $rsp-0x10
+x/4h $rsp+0x10
+x/4h $nosuchreg-0x10
+quit

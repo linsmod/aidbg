@@ -427,6 +427,81 @@ def case_debugbreak():
     return results
 
 
+def case_addr_expr():
+    """Case 4.30b - address-of (&) and halfword examine regression.
+
+    Verifies the three fixes from handover8:
+      * `print &<local>` / `print &<global>` resolve addresses (the unary &
+        operator was missing, so `print &file` failed with
+        "cannot parse expression").
+      * `x/Nh $reg-0xNN` / `$reg+0xNN` parse as address expressions; a broken
+        address silently fell back to dumping the instruction pointer (which is
+        why a halfword request could look like a disassembly of the code).
+      * `x/Nh` dumps halfwords as unit-sized hex values; only `x/Ni`
+        disassembles; a bad register address now reports an error instead of
+        the CIP fallback.
+
+    Stack addresses vary per run, so the dump addresses are parsed from the
+    output and their offsets are checked arithmetically.
+    """
+    results = []
+    script = os.path.join(HERE, "_case_4_30b_addr.txt")
+    lines = [
+        "file test_vars.exe",
+        "start",
+        "break 21",
+        "continue",
+        "print local_sum",
+        "print &local_sum",
+        "print *&local_sum",
+        "print &g_vtick",
+        "x/4h $rsp",
+        "x/4h $rsp-0x10",
+        "x/4h $rsp+0x10",
+        "x/4h 0x1400076c0",
+        "x/4i 0x1400076c0",
+        "x/4h $nosuchreg-0x10",
+        "quit",
+    ]
+    with open(script, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    try:
+        rc, out = aidbg_run(script)
+    finally:
+        if os.path.exists(script):
+            os.unlink(script)
+
+    # `print` value lines, in command order: local_sum, &local_sum,
+    # *&local_sum, &g_vtick.
+    values = [int(m, 16) for m in re.findall(r"value = 0x([0-9a-fA-F]+)", out)]
+    # `x/Nh` dump lines carry the address right after the leading space-less
+    # start of the line followed by a colon (disassembly lines have no colon).
+    dumps = [int(m, 16) for m in re.findall(r"^(0x[0-9a-fA-F]+):", out, re.M)]
+
+    results.append(("local_sum evaluates to 36",
+                    len(values) >= 4 and values[0] == 0x24, out))
+    results.append(("&local_sum resolves (print does not error)",
+                    len(values) >= 2 and values[1] != 0, out))
+    results.append(("*(&local_sum) == local_sum (address round-trip)",
+                    len(values) >= 3 and (values[2] & 0xFFFFFFFF) == 0x24, out))
+    results.append(("&g_vtick is a fixed image address",
+                    len(values) >= 4 and values[3] == 0x14011A280, out))
+    results.append(("x/4h $rsp dumps on the stack (not the image)",
+                    len(dumps) >= 1 and dumps[0] < 0x100000000, out))
+    results.append(("x/4h $rsp-0x10 is 0x10 below $rsp",
+                    len(dumps) >= 2 and dumps[1] == dumps[0] - 0x10, out))
+    results.append(("x/4h $rsp+0x10 is 0x10 above $rsp",
+                    len(dumps) >= 3 and dumps[2] == dumps[0] + 0x10, out))
+    results.append(("x/4h at main dumps halfword values, not disassembly",
+                    len(dumps) >= 4 and dumps[3] == 0x1400076C0 and
+                    "0x8348 0x38ec" in out, out))
+    results.append(("x/4i is the disassembly form",
+                    "SUB RSP, 0x38" in out, out))
+    results.append(("bad register reports bad address",
+                    "error: bad address: $nosuchreg-0x10" in out, out))
+    return results
+
+
 def case_batch_compat():
     """Case 4.22 - GDB invocation compatibility (gdb_quick_reference.txt OPTIONS).
 
@@ -690,6 +765,24 @@ CASES = [
         "expect": ["level1+0x6c (test_vars.c:34)", "local_x2", "0x0000000000000006",
                    "main+0x16 (test_vars.c:42)", "v                       int"],
     },
+    {
+        "id": "4.30",
+        "name": "address-of (&) + GDB examine formats (x/Nfu)",
+        "script": "case_4_30_addr_expr.txt",
+        "expect": ["value = 0x0000000000000024", "value = 0x000000014011a280",
+                   "0x8348 0x38ec", "33608 14572", "-31928 14572",
+                   "1000001101001000", "0101510", "72 'H'",
+                   "0x00000001400076c2:  0x38ec 0x44c7",
+                   "SUB RSP, 0x38", "error: bad address"],
+        "exit": 1,
+    },
+    {
+        "id": "4.30b",
+        "name": "address-of round-trip + $reg±offset dump addresses",
+        "script": None,
+        "expect": None,
+        "dynamic": "addrexpr",
+    },
 ]
 
 
@@ -739,6 +832,8 @@ def main():
             results = case_debugbreak()
         elif case.get("dynamic") == "batchcompat":
             results = case_batch_compat()
+        elif case.get("dynamic") == "addrexpr":
+            results = case_addr_expr()
         else:
             results = run_case(case)
         all_cases.append((case["id"], case["name"], results, case.get("xfail")))

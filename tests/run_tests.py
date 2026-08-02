@@ -40,7 +40,8 @@ BUILD_CMD = os.path.join(HERE, "build.cmd")
 PYTHON = sys.executable
 
 TARGETS = ["test_basic", "test_memory", "test_exception", "test_threads",
-           "test_symbols", "test_attach", "test_checksum", "test_debugbreak"]
+           "test_symbols", "test_attach", "test_checksum", "test_debugbreak",
+           "test_source_step"]
 
 # x86 (WoW64) targets are built with a separate script; aidbg (x64) debugs them
 # cross-architecture, which exercises the STATUS_WX86_BREAKPOINT path.
@@ -426,6 +427,52 @@ def case_debugbreak():
     return results
 
 
+def case_batch_compat():
+    """Case 4.22 - GDB invocation compatibility (gdb_quick_reference.txt OPTIONS).
+
+    Verifies the man-page documented CLI semantics:
+      - `--batch` exits 0 after processing a command file with no errors, and
+        exits nonzero when a command in the file errors.
+      - `-e <file>` (--exec=file) selects the executable.
+    """
+    results = []
+    ok_script = os.path.join(HERE, "_case_4_22_ok.txt")
+    err_script = os.path.join(HERE, "_case_4_22_err.txt")
+    run_script = os.path.join(HERE, "_case_4_22_run.txt")
+    try:
+        with open(ok_script, "w", encoding="utf-8") as f:
+            f.write("file exit_test.exe\nquit\n")
+        with open(err_script, "w", encoding="utf-8") as f:
+            f.write("file exit_test.exe\nbreak nosuchsymbol\n")
+        with open(run_script, "w", encoding="utf-8") as f:
+            f.write("run\nquit\n")
+        p = subprocess.run([AIDBG, "--batch", "-x", ok_script], cwd=ROOT,
+                           capture_output=True, text=True, timeout=90,
+                           encoding="utf-8", errors="replace",
+                           creationflags=CREATE_NO_WINDOW)
+        results.append(("--batch success exits 0",
+                        p.returncode == 0, p.stdout + p.stderr))
+        p = subprocess.run([AIDBG, "--batch", "-x", err_script], cwd=ROOT,
+                           capture_output=True, text=True, timeout=90,
+                           encoding="utf-8", errors="replace",
+                           creationflags=CREATE_NO_WINDOW)
+        results.append(("--batch command error exits nonzero",
+                        p.returncode != 0, p.stdout + p.stderr))
+        p = subprocess.run([AIDBG, "--batch", "-e", os.path.join(ROOT, "exit_test.exe"),
+                            "-x", run_script], cwd=ROOT,
+                           capture_output=True, text=True, timeout=90,
+                           encoding="utf-8", errors="replace",
+                           creationflags=CREATE_NO_WINDOW)
+        results.append(("-e <file> selects the executable (--exec)",
+                        "Process exited with code 42" in (p.stdout + p.stderr),
+                        p.stdout + p.stderr))
+    finally:
+        for f in (ok_script, err_script, run_script):
+            if os.path.exists(f):
+                os.unlink(f)
+    return results
+
+
 # ------------------------------------------------------------- case table ---
 
 CASES = [
@@ -564,6 +611,32 @@ CASES = [
         "script": "case_4_18_hwbreak_wow64.txt",
         "expect": ["Hardware breakpoint 2", "hbreak", "Stopped: hardware"],
     },
+    {
+        "id": "4.19",
+        "name": "source-level step (enters callee)",
+        "script": "case_4_19_source_step.txt",
+        "expect": ["Stopped: step", "callee (test_source_step.c:15)", "test_source_step.c:17"],
+    },
+    {
+        "id": "4.20",
+        "name": "source-level next (skips calls/loops)",
+        "script": "case_4_20_source_next.txt",
+        "expect": ["Stopped: step", "test_source_step.c:30", "test_source_step.c:33"],
+    },
+    {
+        "id": "4.21",
+        "name": "GDB command compatibility (start/step/next/bt/finish/list)",
+        "script": "case_4_21_gdb_compat2.txt",
+        "expect": ["Temporary breakpoint 1, main", "Breakpoint 2, main () at test_source_step.c:29",
+                   "callee (test_source_step.c:15)", "in callee", "main+0x1b", ">   29"],
+    },
+    {
+        "id": "4.22",
+        "name": "GDB invocation compat (--batch exit code, -e)",
+        "script": None,
+        "expect": None,
+        "dynamic": "batchcompat",
+    },
 ]
 
 
@@ -608,6 +681,8 @@ def main():
             results = case_source_checksum()
         elif case.get("dynamic") == "debugbreak":
             results = case_debugbreak()
+        elif case.get("dynamic") == "batchcompat":
+            results = case_batch_compat()
         else:
             results = run_case(case)
         all_cases.append((case["id"], case["name"], results, case.get("xfail")))

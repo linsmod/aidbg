@@ -239,6 +239,11 @@ static ULONG_PTR g_hit_bp_hits = 0;      // its hit count when it fired
 static bool g_cond_failed = false;       // condition eval errored on the last hit
 static bool g_hit_bp_oneshot = false;    // the hit came from a temporary (start) breakpoint
 
+// internal source-step breakpoint (GDB `step`/`next`): a one-shot INT3 placed at the
+// end of the current source line. Kept out of g_bps so it is invisible to the user.
+static ULONG_PTR g_step_bp_addr = 0;     // armed internal step breakpoint (0 = none)
+static DWORD g_step_tid = 0;             // thread that armed the internal step breakpoint
+
 // current "display" thread: 0 = the debug-event thread (TitanEngine context)
 static DWORD g_ctx_tid = 0;
 static CONTEXT g_ctx;                    // cached GetThreadContext snapshot
@@ -270,6 +275,7 @@ static bool mem_read(ULONG_PTR addr, void* buf, SIZE_T n, SIZE_T* nr);
 static bool sym_lookup(const std::string& name, ULONG_PTR& out);
 static bool eval_cond(const std::string& expr, bool& out);
 static void apply_pending_bps();
+static bool src_line(ULONG_PTR addr, std::string& file, long& line);
 static std::string resolve_gdb(ULONG_PTR addr);
 static bool resolve_line(const std::string& file, long line, ULONG_PTR& out);
 static bool require_running();
@@ -544,6 +550,27 @@ static void __cdecl cb_membp(void*)
 static void __cdecl cb_step()   { pause_until_continue("step"); }
 static void __cdecl cb_attach() { pause_until_continue("attach"); }
 
+// internal source-step breakpoint fired. Only the thread that armed the step counts;
+// hits from other threads are resumed so they cannot consume the step.
+static void __cdecl cb_step_bp()
+{
+    auto* de = (DEBUG_EVENT*)GetDebugData();
+    DWORD want = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_bp_mu);
+        want = g_step_tid;
+    }
+    if (de && de->dwThreadId != want) return;
+    ULONG_PTR addr = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_bp_mu);
+        addr = g_step_bp_addr;
+        g_step_bp_addr = 0;
+    }
+    if (addr) DeleteBPX(addr);
+    pause_until_continue("step-bp");
+}
+
 // log-only handlers (DLL load/unload, thread create/exit, debug string)
 static void __cdecl cb_log_event(void*)
 {
@@ -672,6 +699,7 @@ static void reset_state()
     g_running = false;
     g_hit_bp_id = 0; g_hit_bp_hits = 0; g_cond_failed = false;
     g_hit_bp_oneshot = false;
+    g_step_bp_addr = 0; g_step_tid = 0;
     g_ctx_tid = 0; g_ctx_valid = false;
     std::lock_guard<std::mutex> lk2(g_ev_mu);
     g_events.clear();
@@ -823,6 +851,14 @@ static std::string stop_json(const std::string& reason)
     o << "{\"type\":\"stopped\",\"reason\":\"" << js_str(reason) << "\",\"thread\":" << thread
       << ",\"rip\":\"" << hex(rip) << "\",\"rip_symbol\":\"" << js_str(resolve(rip))
       << "\",\"registers\":" << regs_json();
+    {
+        std::string f; long l = 0;
+        if (src_line(rip, f, l)) {
+            size_t slash = f.find_last_of("\\/");
+            std::string base = slash == std::string::npos ? f : f.substr(slash + 1);
+            o << ",\"file\":\"" << js_str(base) << "\",\"line\":" << l;
+        }
+    }
     if (reason == "breakpoint" && g_hit_bp_id) {
         o << ",\"breakpoint_id\":" << g_hit_bp_id << ",\"hits\":" << g_hit_bp_hits;
         if (g_hit_bp_oneshot) o << ",\"temporary\":true";
@@ -1125,6 +1161,64 @@ static bool resolve_line(const std::string& file, long line, ULONG_PTR& out)
     if ((long)li2.LineNumber != line) return false;
     out = (ULONG_PTR)li.Address;
     return out != 0;
+}
+
+// ---------------------------------------------------- source-line stepping ---
+// GDB `step` / `next` are source-line steps. A "step range" is the set of
+// addresses that map to the current source line; executing to the first address
+// whose line differs (with a one-shot breakpoint) runs loops at full speed.
+
+// source file + line number for an address; false when there is no line info
+static bool src_line(ULONG_PTR addr, std::string& file, long& line)
+{
+    if (!g_sym_active || !g_sym_proc) return false;
+    IMAGEHLP_LINEW64 li = {};
+    li.SizeOfStruct = sizeof(li);
+    DWORD col = 0;
+    if (!SymGetLineFromAddrW64(g_sym_proc, (DWORD64)addr, &col, &li)) return false;
+    file = utf8(li.FileName);
+    line = (long)li.LineNumber;
+    return true;
+}
+
+// end (exclusive) of the x64 function containing `addr`, from the .pdata unwind
+// table (dbghelp SymFunctionTableAccess64). 0 when unknown (WoW64 / stripped).
+static ULONG_PTR func_end_x64(ULONG_PTR addr)
+{
+    if (!g_sym_proc) return 0;
+    ULONG64 base = SymGetModuleBase64(g_sym_proc, (DWORD64)addr);
+    if (!base) return 0;
+    PRUNTIME_FUNCTION rf = (PRUNTIME_FUNCTION)SymFunctionTableAccess64(g_sym_proc, (DWORD64)addr);
+    if (!rf) return 0;
+    return (ULONG_PTR)(base + rf->EndAddress);
+}
+
+// first address past `addr` whose source line differs (the "step range" end), by
+// walking forward one instruction at a time. Returns 0 when the walk cannot be
+// done (no line info at start, or the line ends in a ret -- let the caller
+// single-step instead, since the byte after a ret is not the return target).
+static ULONG_PTR line_range_end(ULONG_PTR addr)
+{
+    std::string f0; long l0 = 0;
+    if (!src_line(addr, f0, l0)) return 0;
+    bool is64 = target_is64();
+    ULONG_PTR fend = is64 ? func_end_x64(addr) : 0;
+    PROCESS_INFORMATION* pi = TitanGetProcessInformation();
+    if (!pi || !pi->hProcess) return 0;
+    ULONG_PTR cur = addr;
+    for (int i = 0; i < 2048; i++) {
+        long ln = LengthDisassembleEx(pi->hProcess, (void*)cur);
+        if (ln <= 0) break;
+        unsigned char op = 0; SIZE_T nr = 0;
+        if (!MemoryReadSafe(pi->hProcess, (void*)cur, &op, 1, &nr) || nr != 1) break;
+        if (op == 0xC3 || op == 0xC2) return 0;      // ret / ret imm16: single-step instead
+        cur += (ULONG_PTR)ln;
+        if (fend && cur >= fend) break;              // walked past the function end
+        std::string f; long l = 0;
+        if (!src_line(cur, f, l)) break;             // no line info -> boundary
+        if (l != l0) break;                          // line changed -> range end
+    }
+    return cur;
 }
 
 // ----------------------------------------------------- source/PDB checksum ---
@@ -2030,6 +2124,156 @@ static CmdResult cmd_step(const char* kind, int n)
         return {};
     }
     emit_stop(reason);
+    return {};
+}
+
+// -- step / next (source-line) --
+
+// read the return address pushed by the current call frame (from the stack top)
+static ULONG_PTR read_stack_return(bool is64)
+{
+    PROCESS_INFORMATION* pi = TitanGetProcessInformation();
+    if (!pi || !pi->hProcess) return 0;
+    ULONG_PTR sp = reg_get(UE_CSP);
+    if (!sp) return 0;
+    if (is64) {
+        ULONG_PTR ret = 0; SIZE_T nr = 0;
+        if (!MemoryReadSafe(pi->hProcess, (void*)sp, &ret, sizeof(ret), &nr) || nr != sizeof(ret)) return 0;
+        return ret;
+    }
+    DWORD ret = 0; SIZE_T nr = 0;
+    if (!MemoryReadSafe(pi->hProcess, (void*)sp, &ret, sizeof(ret), &nr) || nr != sizeof(ret)) return 0;
+    return (ULONG_PTR)ret;
+}
+
+// remove the internal source-step breakpoint, if any
+static void clear_internal_bp()
+{
+    std::lock_guard<std::mutex> lk(g_bp_mu);
+    ULONG_PTR addr = g_step_bp_addr;
+    g_step_bp_addr = 0;
+    if (addr) DeleteBPX(addr);
+}
+
+// arm the internal one-shot breakpoint at `addr` and run; returns the stop reason
+static std::string run_to_internal_bp(ULONG_PTR addr)
+{
+    {
+        std::lock_guard<std::mutex> lk(g_bp_mu);
+        if (g_step_bp_addr) { ULONG_PTR old = g_step_bp_addr; g_step_bp_addr = 0; if (old) DeleteBPX(old); }
+        g_step_bp_addr = addr;
+        g_step_tid = ctx_event_tid();
+    }
+    if (!SetBPX(addr, UE_BREAKPOINT | UE_BREAKPOINT_TYPE_INT3, (void*)&cb_step_bp)) {
+        std::lock_guard<std::mutex> lk(g_bp_mu);
+        g_step_bp_addr = 0;
+        ctx_reset();
+        StepInto((void*)&cb_step);
+        resume_waiting_callback();
+        return wait_stop_consume();
+    }
+    ctx_reset();
+    resume_waiting_callback();
+    return wait_stop_consume();
+}
+
+// Execute ONE source-line step. kind: "over" (next) or "into" (step).
+// Returns:
+//   "ok"      -- stopped at a new source line (done)
+//   "noinfo"  -- no line info at the start: caller falls back to instruction step
+//   "exited"  /  "ended"  -- the inferior exited
+//   other     -- stopped at a user breakpoint / exception / hardware bp (done)
+static std::string source_step_once(const char* kind)
+{
+    ULONG_PTR rip0 = reg_get(UE_CIP);
+    std::string f0; long l0 = 0;
+    if (!src_line(rip0, f0, l0)) return "noinfo";
+    bool is64 = target_is64();
+    std::string reason = "ok";
+    int noinfo = 0;              // consecutive instructions without line info
+    ULONG_PTR escape = 0;        // return address captured when first losing line info
+    bool have_escape = false;
+    for (int guard = 0; guard < 4096; guard++) {
+        ULONG_PTR rip = reg_get(UE_CIP);
+        std::string f; long l = 0;
+        bool has = src_line(rip, f, l);
+        if (has) {
+            noinfo = 0; have_escape = false;
+            if (f != f0 || l != l0) return "ok";
+        }
+        if (!has) {
+            // In code without line info (e.g. entered a jump thunk or CRT/OS code).
+            if (strcmp(kind, "into") == 0) {
+                // Single-step briefly first: a 1-instruction jump thunk can lead back
+                // into instrumented code (the real callee), which we must follow.
+                // Only when we stay without line info for a while do we run to the
+                // return address, skipping a large uninstrumented callee like printf.
+                if (!have_escape) { escape = read_stack_return(is64); have_escape = true; }
+                if (noinfo >= 32 && escape) {
+                    reason = run_to_internal_bp(escape);
+                } else {
+                    noinfo++;
+                    ctx_reset(); StepInto((void*)&cb_step);
+                    resume_waiting_callback(); reason = wait_stop_consume();
+                }
+            } else {
+                // next: we reached a boundary with no line info; stop here
+                return "ok";
+            }
+        } else if (strcmp(kind, "over") == 0) {
+            // run the rest of the line at full speed: one-shot bp at the range end
+            ULONG_PTR end = line_range_end(rip);
+            if (!end || end <= rip) {
+                ctx_reset(); StepOver((void*)&cb_step);
+                resume_waiting_callback(); reason = wait_stop_consume();
+            } else {
+                reason = run_to_internal_bp(end);
+            }
+        } else {
+            // step: single-step; calls are entered naturally
+            ctx_reset(); StepInto((void*)&cb_step);
+            resume_waiting_callback(); reason = wait_stop_consume();
+        }
+
+        if (reason == "exited" || reason == "ended") return reason;
+        if (reason != "step-bp" && reason != "step" && reason != "single-step")
+            return reason;   // stopped at a real breakpoint / exception
+        // internal bp or single-step fired: loop re-checks the line
+    }
+    return "ok";   // safety: stepped many times without leaving the line
+}
+
+static CmdResult cmd_source_step(const char* kind, int n)
+{
+    if (!require_running()) return {false, "no active debug session"};
+    if (!g_waiting) return {false, "target is not stopped"};
+    if (n < 1) n = 1;
+    std::string reason;
+    for (int i = 0; i < n; i++) {
+        reason = source_step_once(kind);
+        if (reason == "noinfo") {
+            clear_internal_bp();
+            // GDB: without line info, step by instruction instead
+            if (!g_json && !g_silent) printf("  (no source line info; stepping by instruction)\n");
+            return cmd_step(strcmp(kind, "over") == 0 ? "over" : "into", n - i);
+        }
+        if (reason == "exited" || reason == "ended") break;
+        if (reason != "ok") break;   // stopped at a user breakpoint / exception
+    }
+    clear_internal_bp();
+    if (reason == "exited") {
+        if (g_json) printf("{\"type\":\"exited\",\"code\":%ld}\n", GetExitCode());
+        else if (!g_silent) printf("Process exited with code %ld\n", GetExitCode());
+        fflush(stdout);
+        return {};
+    }
+    if (reason == "ended") {
+        if (g_json) printf("{\"type\":\"exited\",\"code\":%ld}\n", GetExitCode());
+        else if (!g_silent) printf("Debug session ended\n");
+        fflush(stdout);
+        return {};
+    }
+    emit_stop(reason == "ok" ? "step" : reason);
     return {};
 }
 
@@ -3252,8 +3496,10 @@ static const char* HELP =
 "  detach                      detach and leave target running\n"
 "  kill                        terminate the current run\n"
 "  continue / c / cont         resume execution\n"
-"  stepi / si / s / step       single-step instructions (s/step = source-line fallback)\n"
-"  nexti / ni / n / next       step over calls\n"
+"  stepi / si                   single-step instructions\n"
+"  nexti / ni                   step over one instruction (calls)\n"
+"  step / s [n]                 source-line step: into calls (n lines; fallback stepi)\n"
+"  next / n [n]                 source-line step: over calls (n lines; fallback nexti)\n"
 "  finish / fin                run until the current function returns (stops in the caller)\n"
 "  break <addr> / b            set software breakpoint (*addr | addr | $reg | mod!api)\n"
 "  break <symbol>              set breakpoint by PDB symbol name (e.g. break main)\n"
@@ -3361,15 +3607,15 @@ static CmdResult execute(const std::string& line)
         int n = tok.size() > 1 ? atoi(tok[1].c_str()) : 1;
         return cmd_step("over", n);
     }
-    // GDB: step/next are source-line steps; without source symbols they fall
-    // back to instruction stepping (stepi/nexti)
+    // GDB: step/next are source-line steps; without line info they fall back
+    // to instruction stepping (stepi/nexti)
     if (cmd == "step" || cmd == "s") {
         int n = tok.size() > 1 ? atoi(tok[1].c_str()) : 1;
-        return cmd_step("into", n);
+        return cmd_source_step("into", n);
     }
     if (cmd == "next" || cmd == "n") {
         int n = tok.size() > 1 ? atoi(tok[1].c_str()) : 1;
-        return cmd_step("over", n);
+        return cmd_source_step("over", n);
     }
     if (cmd == "finish" || cmd == "fin") return cmd_step("out", 1);
     if (cmd == "break" || cmd == "b" || cmd == "br") return cmd_break(tok.size() > 1 ? std::vector<std::string>(tok.begin()+1, tok.end()) : std::vector<std::string>());

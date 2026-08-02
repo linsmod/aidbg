@@ -1,0 +1,14 @@
+# Case 4.19 - source-level step (GDB `step`/`s`): enters functions at their first line
+# Target: test_source_step.exe
+# Expected:
+#   - `step` at the callee() call line enters callee() at its first source line
+#   - `step 2` advances two source lines inside the callee
+file test_source_step.exe
+start
+break 29
+continue
+step
+where
+step 2
+where
+quit

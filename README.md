@@ -102,11 +102,84 @@ set source-checksum on|off / show source-checksum
 echo / help / quit(q)
 ```
 
+## GDB 兼容命令清单
+
+以下为已实现命令与 GDB 的行为对齐情况（按 GDB 手册章节归类）。图例：
+**✅** = 语义与 GDB 实测一致；**⚠️** = 部分一致（差异见"已知边界"或附注）；
+**ⓘ** = aidbg 独有扩展（GDB 无对应命令）。"用例"列指向 `tests/run_tests.py`
+中的自动化核对（4.21 为 man page 核心命令端到端走查，4.22 核对 CLI 批处理语义）。
+
+### 运行与单步（Running / Stopping）
+
+| 命令 | GDB 语义 | aidbg 行为 | 兼容 | 用例 |
+| :--- | :--- | :--- | :--- | :--- |
+| `run [args]` | 启动程序 | 同左（batch 下继续到退出/崩溃） | ✅ | 4.1b |
+| `start [func]` | 启动并停到入口函数 | 停到 main/WinMain（或指定函数） | ✅ | 4.1 |
+| `continue` / `c` | 继续运行 | 同左 | ✅ | 4.1 |
+| `step` / `s [n]` | 源码行单步，**进入**调用 | 同左（无行号回退 stepi 并提示） | ✅ | 4.19/4.21 |
+| `next` / `n [n]` | 源码行单步，**越过**调用 | 同左（无行号回退 nexti 并提示） | ✅ | 4.20/4.21 |
+| `stepi` / `si [n]` | 指令单步 | 同左 | ✅ | 4.5 |
+| `nexti` / `ni [n]` | 指令单步（越过 call） | 同左 | ✅ | 4.5 |
+| `finish` | 运行到当前帧返回 | 停在调用方返回后的下一条指令 | ✅ | 4.12/4.21 |
+| `kill` | 终止运行 | 同左 | ✅ | — |
+| `attach <pid>` | 附加进程 | 同左 | ✅ | 4.8 |
+| `detach` | 分离 | 同左（目标保持运行） | ✅ | 4.8 |
+
+### 断点（Breakpoints）
+
+| `break <symbol>` | 按符号设断点 | 同左（PDB 解析，run 前可 pending） | ✅ | 4.9/4.1b |
+| `break <行号>` / `<file.c:行号>` | 按源码行设断点 | 同左（越界行号报 `No line N`） | ✅ | 4.11 |
+| `break <addr>` / `*addr` | 按地址设断点 | 同左 | ✅ | 4.1 |
+| `hbreak <addr\|sym> [r/w/x]` | 硬件断点 | 同左 | ✅ | 4.17/4.18 |
+| `watch` / `rwatch` / `awatch` | 数据观察点 | 同左（TitanEngine guard-page，页级粒度） | ⚠️ | 4.3 |
+| `condition <id> [expr]` | 断点条件 | 同左（不支持局部变量名） | ⚠️ | 4.2b |
+| `ignore <id> <count>` | 忽略前 N 次命中 | 同左 | ✅ | 4.2 |
+| `delete` / `disable` / `enable` | 删除/禁用/启用断点 | 同左（无参 = 全部） | ✅ | 4.12 |
+| `mbreak <addr> <size>` | — | aidbg 独有（内存范围断点） | ⓘ | 4.3 |
+
+### 栈与线程（Stack / Threads）
+
+| `bt` / `where` | 栈回溯 | 同左（StackWalk64，优化构建可用） | ✅ | 4.1/4.21 |
+| `info locals` / `info args` | 局部变量 / 函数参数 | 同左（需完整 PDB，见已知边界） | ✅ | 4.6 |
+| `thread <id>` | 切换线程 | 同左（内部编号或 OS TID） | ✅ | 4.7b |
+| `info threads` | 列出线程 | 同左（`*` 标当前线程） | ✅ | 4.7 |
+
+### 源码与符号（Source / Symbols）
+
+| `list` / `l [func\|line]` | 显示当前行附近源码 | 同左（±5 行，`>` 标当前行） | ✅ | 4.9/4.21 |
+| `info source` | 当前源文件信息 | 同左（另做 PDB 校验和校验） | ✅ | 4.14 |
+| `info files` | 符号文件 / 入口点 / 加载文件 | 同左 | ✅ | 4.13 |
+
+### 数据（Data）
+
+| `print` / `p` | 打印表达式 | 支持 `$reg` / 字面量 / `*addr` / 全局符号；**不支持表达式与局部标识符** | ⚠️ | 4.6 |
+| `x/<n><fmt> <addr>` | 检视内存 | 同左（b/h/w/g + x/d/u/i/s/c/f） | ✅ | 4.12 |
+| `set $reg = <val>` | 写寄存器 | 同左 | ✅ | 4.6 |
+| `set *addr = <val>` | 写内存 | 同左 | ✅ | 4.6 |
+| `registers` / `regs` | `info registers` 快捷别名 | 同左 | ✅ | — |
+
+### 反汇编与工具（Disassembly / Misc）
+
+| `disas` / `disassemble [start,end]` | 反汇编 | 同左（GDB 区间语法） | ✅ | 4.5 |
+| `help` / `quit` / `echo` | 帮助 / 退出 / 输出 | 同左 | ✅ | — |
+| `dump` / `search` / `strings` / `info modules\|events\|proc` | — | aidbg 独有扩展 | ⓘ | 4.10 |
+
+### 命令行（Invocation，见 gdb_quick_reference.txt OPTIONS）
+
+| `--batch` | 批处理，命令出错退出码非零 | 同左（用例 4.22 核对） | ✅ | 4.22 |
+| `-ex "cmd"` / `-x file` | 执行命令 / 命令文件 | 同左 | ✅ | 4.22 |
+| `-e file` (`--exec=file`) | 选择可执行文件 | 同左 | ✅ | 4.22 |
+| `--args prog arg...` | 设置目标与参数 | 同左（裸 `run` 用该参数） | ✅ | — |
+| `-q` / `--quiet` | 抑制启动横幅 | 同左 | ✅ | — |
+| `--command` | 单命令执行 | 同左（参数为文件路径时按命令文件执行） | ✅ | 4.12 |
+| `--json` | — | aidbg 独有 JSON Lines 机器接口 | ⓘ | — |
+
 ## 测试
 
-`tests/` 套件：6 个测试目标（基础 / 内存 / 异常 / 多线程 / 符号 / 驻留进程）+ 19 项
-自动化用例，覆盖断点、条件 / ignore、内存观察点、异常、单步、变量枚举、线程切换、
-attach/detach、搜索、行号断点与 GDB 兼容性，全部通过：
+`tests/` 套件：7 个测试目标（基础 / 内存 / 异常 / 多线程 / 符号 / 源码单步 /
+驻留进程）+ 自动化用例，覆盖断点、条件 / ignore、内存观察点、异常、单步、
+源码级 `step`/`next`、变量枚举、线程切换、attach/detach、搜索、行号断点、
+GDB 兼容性（含 4.21 命令走查与 4.22 批处理退出码核对），全部通过：
 
 ```cmd
 set _NT_SYMBOL_PATH=%CD%\..
@@ -118,18 +191,16 @@ tests\run_tests.cmd        :: 全绿返回 0，可接入 CI
 
 | 文档 | 说明 |
 | :--- | :--- |
-| `handleover.md` | 架构实现、TitanEngine API 事实、命令集、AI 接口 |
-| `handover2.md` | 断点现场 / 栈回溯 / 变量 / 源码 / 条件断点 |
-| `handover3.md` | GDB 兼容性修复（finish / x-i / thread / info files 等） |
-| `handover4.md` | 源码/PDB 校验（info source / source-checksum，算法映射实测） |
 | `TestGuid.md` | 测试程序与测试逻辑设计指导 |
 | `ISSUES.md` | 已知问题清单与修复记录 |
 | `tests/README.md` | 测试套件说明 |
+| `archive/README.md` | 历期实现细节与过程总览（handover 1–5 索引） |
 
 ## 已知边界
 
-- `print <裸标识符>`、`condition` 局部变量、源码级 `step`/`next` 未实现
-  （`stepi`/`nexti` 指令级可用）。
+- `print <裸标识符>`、`condition` 局部变量未实现（`print` 支持 `$reg`/字面量/`*addr`）。
+- 源码级 `step`/`next` 已实现（`archive/handover5.md`）；无 PDB 行号时回退指令级单步
+  （`stepi`/`nexti`）并提示。
 - 32 位（WOW64）目标已支持（软件/硬件断点、单步；用例 4.16–4.18）。
 - `info locals` 对 `/DEBUG:FASTLINK` 或 `/O2` 构建的变量枚举受 dbghelp 物理限制。
 

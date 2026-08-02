@@ -1,0 +1,16 @@
+# Case 4.20 - source-level next (GDB `next`/`n`): skips calls and loops
+# Target: test_source_step.exe
+# Expected:
+#   - `next` over the callee() call lands on the next source line (does NOT enter)
+#   - `next` steps into the for-loop body, then `next 2` runs the loop to the end
+file test_source_step.exe
+start
+break 29
+continue
+next
+where
+next
+where
+next 2
+where
+quit

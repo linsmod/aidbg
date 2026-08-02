@@ -1,0 +1,23 @@
+# Case 4.21 - GDB command compatibility check (README "GDB 兼容命令清单")
+# Target: test_source_step.exe
+# Walks through the GDB man-page core (start/break/continue/step/next/bt/
+# finish/list) exactly as documented and asserts each command's documented
+# semantics:
+#   - start stops at main (temporary breakpoint 1)
+#   - break 29 + continue stop at the source line
+#   - step ENTERS callee() (stops at callee's first source line)
+#   - bt shows the callee frame
+#   - next advances within callee()
+#   - finish returns to the caller (main)
+#   - list shows the current source line
+file test_source_step.exe
+start
+break 29
+continue
+step
+where
+next
+finish
+where
+list
+quit

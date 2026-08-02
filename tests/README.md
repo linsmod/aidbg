@@ -14,6 +14,7 @@ tests/
     test_exception.c   异常：除零(divzero) / 访问违例(av)
     test_threads.c     多线程：两个工作线程 + 主线程
     test_symbols.c     符号与源码定位：add() 函数
+    test_source_step.c 源码级 step/next：callee() + 循环
     test_attach.c      常驻目标：供 attach/detach 测试
   cases/               各测试用例的 aidbg 命令脚本（TestGuid.md 第 4 节）
   build.cmd            MSVC 编译脚本（方案 B 专用参数，见下）
@@ -74,6 +75,12 @@ cl /nologo /Zi /Od /Oy- /GS- /MTd /Fe:<target>.exe <target>.c /link /DEBUG:FULL 
 | 4.14 | （运行器动态驱动） | 源码/PDB 校验（`info source`、list 警告） | 源未改动 `Checksum: ok`；篡改后 `mismatch` + `!! Checksum mismatch`（仅开关开启时） |
 | 4.15 | （运行器动态驱动） | breakpoint continue 状态 | `DebugBreak()` 被 aidbg 消费；`RaiseException(STATUS_BREAKPOINT)` 仍进入 SEH |
 | 4.16 | `case_4_16_wow64_bp.txt` | 32 位（WoW64）断点延续 | x86 目标 `break wow_target` 命中 3 次、`continue` 推进、`stepi` 正常 |
+| 4.17 | `case_4_17_hwbreak_x64.txt` | 硬件断点（x64） | `hbreak write_data` 命中、`Stopped: hardware` |
+| 4.18 | `case_4_18_hwbreak_wow64.txt` | 硬件断点（WoW64） | 同上，x86 目标 |
+| 4.19 | `case_4_19_source_step.txt` | 源码级 `step`（进入被调函数） | `step` 进入 `callee` 首行（`callee (test_source_step.c:15)`），`step 2` 推进两行 |
+| 4.20 | `case_4_20_source_next.txt` | 源码级 `next`（跳过调用/循环） | `next` 越过 `callee()` 停到下一行，`next` 进循环体、`next 2` 全速跑完循环 |
+| 4.21 | `case_4_21_gdb_compat2.txt` | GDB 兼容命令走查（man page 核心） | `start`→`break 29`→`continue`→`step` 进 `callee`→`bt`→`next`→`finish` 回 main→`list` 标当前行 |
+| 4.22 | （运行器动态驱动） | GDB 调用兼容（--batch 退出码、`-e`） | `--batch` 成功退出 0、命令出错退出非 0；`-e <file>` 选中目标并运行 |
 
 > **断点编号**：`start` 的一次性入口断点占用 id 1（GDB 一致），因此 4.2/4.2b 的
 > `break func1` 为 id 2、4.9 的 `break add` 为 id 2，脚本与断言均已按此编号。
@@ -99,6 +106,8 @@ cl /nologo /Zi /Od /Oy- /GS- /MTd /Fe:<target>.exe <target>.c /link /DEBUG:FULL 
   断点：aidbg 为 x64，32 位目标的 `int3` 以 `STATUS_WX86_BREAKPOINT`（0x4000001f）
   上报，TitanEngine 需消费该断点。断言 `break wow_target` 命中 3 次（无重复回调）、
   `continue` 正常推进、`stepi` 可单步。
+- **4.22**：动态调用三次 `aidbg --batch`，断言 man page 的 OPTIONS 语义——成功脚本
+  退出码 0、命令出错退出码非 0、`-e <file>`（`--exec`）选中目标并运行（退出码 42）。
 
 ## 与 TestGuid.md 的差异说明（实现现实）
 
@@ -123,6 +132,11 @@ cl /nologo /Zi /Od /Oy- /GS- /MTd /Fe:<target>.exe <target>.c /link /DEBUG:FULL 
    `x/i` 反汇编、`hbreak` 支持符号名、`--command <file>` 按 GDB 语义执行命令文件、
    `thread <内部编号>` 切换（`info threads` 显示 `* 1 <tid>`）、`disable`/`enable`
    无参作用于全部断点、`info files` 输出符号文件/入口点/加载文件。
+10. **源码级 `step`/`next`（archive/handover5.md）**：需要 PDB 行号；无行号时回退指令单步
+    （`stepi`/`nexti`）并提示 `(no source line info; stepping by instruction)`。
+    `next` 用"行区间端点一次性断点"跑同一行的循环（全速）；`step` 逐指令单步并
+    跟随跳转 thunk（`call` 经 `JMP` thunk 仍能进入被调函数），无行信息区域单步
+    32 条后跳回返回地址。
 
 ## 退出码约定
 

@@ -94,8 +94,8 @@ stdin pipe for multi-command sessions.
 
 - `print <bare identifier>`, `condition` with local variables, and source-level
   `step`/`next` are not implemented (`stepi`/`nexti` at instruction level work);
-- 32-bit (WOW64) targets not yet verified;
-- `SetHardwareBreakPoint` always fails under TitanEngine — a pre-existing engine issue.
+- 32-bit (WOW64) targets supported: software/hardware breakpoints, single-step,
+  bt (cases 4.16–4.18).
 
 ## Verification Status
 

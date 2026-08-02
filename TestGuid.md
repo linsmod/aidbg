@@ -293,6 +293,39 @@ aidbg --batch -ex "file test_wow64.exe" -ex "start" -ex "break wow_target" -ex "
 - `stepi 2` 在 32 位目标上正常单步。
 
 
+### 4.17 硬件断点（x64）
+
+```bash
+aidbg --batch -ex "file test_basic.exe" -ex "start" -ex "hbreak func1" -ex "info break" -ex "continue" -ex "continue" -ex "continue" -ex "quit"
+```
+**预期**：
+- `hbreak func1` 在函数入口设置 DR 断点（`Hardware breakpoint 2 ... (DR0)`）。
+- `info break` 列出类型为 `hbreak`。
+- func1 被主循环调用 3 次，命中 3 次 `Stopped: hardware`。
+
+> 注：早前 `SetHardwareBreakPoint` 一直失败的根因是 aidbg 对
+> `GetUnusedHardwareBreakPointRegister` 返回值（已是 `UE_DR0..3`）又加了一次
+> `UE_DR0`，导致寄存器索引溢出（`DR11` 等），已修复为直接使用该返回值。
+
+### 4.18 硬件断点（WoW64）
+
+```bash
+aidbg --batch -ex "file test_wow64.exe" -ex "start" -ex "hbreak wow_target" -ex "info break" -ex "continue" -ex "continue" -ex "continue" -ex "quit"
+```
+**预期**：
+- `start` 正常停到 `main`（WoW64 loader 初始化断点 `LdrInitShimEngineDynamic`
+  被 aidbg 自动跳过）。
+- `hbreak wow_target` 在 32 位目标上设置 DR 断点，`info break` 列出 `hbreak`。
+- wow_target 被主循环调用 3 次，命中 3 次 `Stopped: hardware`。
+
+> 注：WoW64 硬件断点能工作的前提是 `start` 必须真正停到 32 位用户代码
+> （main）。早期 aidbg 在 WoW64 下把 loader 初始化断点（`0x4000001f` at
+> `LdrInitShimEngineDynamic`）误报为异常，导致 `start` 停在 64 位原生代码
+> 上下文，此时设置的 DR 对 32 位代码无效。已修复：紧跟 native 系统断点后的
+> WoW64 初始化断点自动继续，`start` 正常停到 main。
+
+
+
 ## 5. 测试程序编译策略（分层构建）
 
 `aidbg` 的目标是像 Visual Studio 一样鲁棒，能够调试各种编译配置下的程序。但不同的编译设置对调试信息的完整度有直接影响。为高效验证调试器的各项能力，建议根据测试目的采用不同的编译策略。

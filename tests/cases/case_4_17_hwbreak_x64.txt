@@ -1,0 +1,14 @@
+# Case 4.17 - hardware breakpoint (x64) (TestGuid.md section 4.17)
+# Target: test_basic.exe (x64)
+# Expected:
+#   - `hbreak func1` sets a DR breakpoint on the function entry
+#   - `info break` lists it as type hbreak
+#   - func1 is called 3 times by main's loop -> 3 hardware stops
+file test_basic.exe
+start
+hbreak func1
+info break
+continue
+continue
+continue
+quit

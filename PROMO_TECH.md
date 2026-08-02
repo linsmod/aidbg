@@ -84,8 +84,7 @@ aidbg.exe --json --command "bt" target.exe
 
 - `print <裸标识符>`、`condition` 局部变量、`step`/`next` 源码级单步未实现
   （`stepi`/`nexti` 指令级可用）；
-- 32 位（WOW64）目标未验证；
-- 硬件断点 `SetHardwareBreakPoint` 在 TitanEngine 下始终失败，属引擎环境问题。
+- 32 位（WOW64）目标已支持：软件/硬件断点、单步、bt（用例 4.16–4.18）。
 
 ## 验证现状
 

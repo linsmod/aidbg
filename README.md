@@ -130,8 +130,7 @@ tests\run_tests.cmd        :: 全绿返回 0，可接入 CI
 
 - `print <裸标识符>`、`condition` 局部变量、源码级 `step`/`next` 未实现
   （`stepi`/`nexti` 指令级可用）。
-- 32 位（WOW64）目标未验证。
-- 硬件断点 `SetHardwareBreakPoint` 在 TitanEngine 下始终失败（引擎环境问题）。
+- 32 位（WOW64）目标已支持（软件/硬件断点、单步；用例 4.16–4.18）。
 - `info locals` 对 `/DEBUG:FASTLINK` 或 `/O2` 构建的变量枚举受 dbghelp 物理限制。
 
 ## 致谢与许可

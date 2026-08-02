@@ -119,6 +119,11 @@ enum {
     UE_R14=33, UE_R15=34, UE_CIP=35, UE_CSP=36,
 };
 
+// WoW64 exception codes (a 64-bit debugger sees these for a 32-bit target)
+#ifndef STATUS_WX86_BREAKPOINT
+#define STATUS_WX86_BREAKPOINT 0x4000001f
+#endif
+
 enum {
     UE_CH_BREAKPOINT=1, UE_CH_SINGLESTEP=2, UE_CH_ACCESSVIOLATION=3, UE_CH_ILLEGALINSTRUCTION=4,
     UE_CH_NONCONTINUABLEEXCEPTION=5, UE_CH_ARRAYBOUNDSEXCEPTION=6, UE_CH_FLOATDENORMALOPERAND=7,
@@ -188,6 +193,8 @@ static std::thread g_loop_thread;
 static DWORD g_exception_code = 0;          // last exception info
 static ULONG_PTR g_exception_addr = 0;
 static bool g_handle_exception_on_resume = false; // selected by the active stop callback
+static bool g_sysbreak_done = false;        // initial system breakpoint consumed
+static bool g_skip_wx86_init = false;       // skip WoW64 loader-init breakpoint after sysbp
 
 static std::vector<std::string> g_events;   // event log
 static std::mutex g_ev_mu;
@@ -411,8 +418,16 @@ static void __cdecl cb_exit(void*)
 }
 
 // stop handlers (TitanEngine calls them with one arg: &DBGEvent / exception record)
-static void __cdecl cb_system_bp(void*) { pause_until_continue("initial-break"); }
-static void __cdecl cb_single_step(void*) { pause_until_continue("single-step"); }
+static void __cdecl cb_system_bp(void*)
+{
+    g_sysbreak_done = true;
+    g_skip_wx86_init = true;   // next WX86 bp (LdrInitShimEngineDynamic) is loader init
+    pause_until_continue("initial-break");
+}
+static void __cdecl cb_single_step(void*)
+{
+    pause_until_continue("single-step");
+}
 static void __cdecl cb_access_violation(void*)
 {
     auto* de = (DEBUG_EVENT*)GetDebugData();
@@ -431,6 +446,18 @@ static void __cdecl cb_exception_stop(void*)
     if (de && de->dwDebugEventCode == EXCEPTION_DEBUG_EVENT) {
         g_exception_code = de->u.Exception.ExceptionRecord.ExceptionCode;
         g_exception_addr = (ULONG_PTR)de->u.Exception.ExceptionRecord.ExceptionAddress;
+
+        // Under WoW64 (x64 debugger, 32-bit target) the initial system breakpoint
+        // surfaces as STATUS_WX86_BREAKPOINT (0x4000001f), not STATUS_BREAKPOINT.
+        // Right after the native system breakpoint TitanEngine fires a loader-init
+        // WX86 breakpoint at LdrInitShimEngineDynamic; that is startup plumbing,
+        // not user code - continue past it automatically (do not stop).
+        if (g_skip_wx86_init && g_exception_code == STATUS_WX86_BREAKPOINT) {
+            g_skip_wx86_init = false;
+            g_sysbreak_done = true;
+            SetNextDbgContinueStatus(DBG_CONTINUE);
+            return;
+        }
 
         // Breakpoint disposition is debugger policy, not an engine heuristic.
         // Preserve TitanEngine's NOT_HANDLED default for RaiseException and
@@ -640,6 +667,8 @@ static void reset_state()
     g_stopped = false; g_waiting = false; g_exited = false; g_quit = false;
     g_reason.clear(); g_exception_code = 0; g_exception_addr = 0;
     g_handle_exception_on_resume = false;
+    g_sysbreak_done = false;
+    g_skip_wx86_init = false;
     g_running = false;
     g_hit_bp_id = 0; g_hit_bp_hits = 0; g_cond_failed = false;
     g_hit_bp_oneshot = false;
@@ -2357,8 +2386,8 @@ static CmdResult cmd_hbreak(const std::vector<std::string>& args)
     }
     DWORD reg = 0;
     if (!GetUnusedHardwareBreakPointRegister(&reg)) return {false, "no free hardware breakpoint slot"};
-    // reg is an index 0..3; map to UE_DR0..3
-    DWORD drIdx = UE_DR0 + reg;
+    // EngineIsThereFreeHardwareBreakSlot already returns UE_DR0..UE_DR3.
+    DWORD drIdx = reg;
     if (!SetHardwareBreakPoint(addr, drIdx, type, size, (void*)&cb_hwbp))
         return {false, "SetHardwareBreakPoint failed"};
     Bpx b; b.id = g_bp_next_id++; b.kind = 2; b.addr = addr; b.hwreg = drIdx; b.hwtype = type; b.enabled = true;
@@ -2366,7 +2395,8 @@ static CmdResult cmd_hbreak(const std::vector<std::string>& args)
     g_bps[b.id] = b;
     CmdResult cr;
     cr.js = "{\"breakpoint\":{\"id\":" + std::to_string(b.id) + ",\"kind\":\"hardware\",\"address\":\"" + hex(addr) + "\"}}";
-    cr.text = "Hardware breakpoint " + std::to_string(b.id) + " at " + hex(addr) + " (DR" + std::to_string(reg) + ")";
+    cr.text = "Hardware breakpoint " + std::to_string(b.id) + " at " + hex(addr)
+            + " (DR" + std::to_string(drIdx - UE_DR0) + ")";
     return cr;
 }
 

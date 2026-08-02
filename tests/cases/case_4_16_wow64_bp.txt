@@ -15,6 +15,5 @@ break wow_target
 continue
 continue
 continue
-continue
 stepi 2
 quit

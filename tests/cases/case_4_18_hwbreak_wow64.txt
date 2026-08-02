@@ -1,0 +1,16 @@
+# Case 4.18 - hardware breakpoint on a 32-bit (WoW64) target (TestGuid.md 4.18)
+# Target: test_wow64.exe (x86)
+# Expected:
+#   - `start` stops at main (loader-init WX86 breakpoint is skipped)
+#   - `hbreak wow_target` arms a DR breakpoint on the 32-bit target
+#   - wow_target runs 3 times (main loop) -> 3 hardware stops
+file test_wow64.exe
+start
+hbreak wow_target
+info break
+continue
+continue
+continue
+continue
+continue
+quit

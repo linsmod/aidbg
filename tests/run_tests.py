@@ -552,11 +552,28 @@ CASES = [
         "script": "case_4_16_wow64_bp.txt",
         "expect": ["Stopped: breakpoint", "wow_target", "hit 3", "Stopped: step"],
     },
+    {
+        "id": "4.17",
+        "name": "hardware breakpoint (x64)",
+        "script": "case_4_17_hwbreak_x64.txt",
+        "expect": ["Hardware breakpoint 2", "hbreak", "Stopped: hardware"],
+    },
+    {
+        "id": "4.18",
+        "name": "hardware breakpoint (WoW64)",
+        "script": "case_4_18_hwbreak_wow64.txt",
+        "expect": ["Hardware breakpoint 2", "hbreak", "Stopped: hardware"],
+    },
 ]
 
 
 def run_case(case):
-    """Run one static case, return list of (label, passed, output)."""
+    """Run one static case, return list of (label, passed, output).
+
+    Cases marked `xfail` document a known limitation: the assertions are still
+    evaluated, but failure is reported as XFAIL (expected) instead of FAIL, so
+    the suite stays green while the limitation is visible.
+    """
     script = os.path.join(CASES_DIR, case["script"])
     rc, out = aidbg_run(script)
     results = [("script exits", rc == 0, out)]
@@ -580,7 +597,7 @@ def main():
         print("error: failed to build targets")
         return 1
 
-    # (id, name, results)
+    # (id, name, results, xfail_reason)
     all_cases = []
     for case in CASES:
         if args.case and case["id"] != args.case:
@@ -593,23 +610,27 @@ def main():
             results = case_debugbreak()
         else:
             results = run_case(case)
-        all_cases.append((case["id"], case["name"], results))
+        all_cases.append((case["id"], case["name"], results, case.get("xfail")))
 
     if args.case in (None, "4.7b"):
-        all_cases.append(("4.7b", "thread switching + bt", case_thread_switch()))
+        all_cases.append(("4.7b", "thread switching + bt", case_thread_switch(), None))
     if args.case in (None, "4.8"):
-        all_cases.append(("4.8", "attach / detach", case_attach_detach()))
+        all_cases.append(("4.8", "attach / detach", case_attach_detach(), None))
     # report
     print("\n%-6s  %-40s  %-6s  %s" % ("CASE", "NAME", "STATUS", "DETAIL"))
     print("-" * 100)
     total = failed = 0
-    for cid, name, results in all_cases:
+    for cid, name, results, xfail in all_cases:
         ok = all(p for _, p, _ in results)
         total += 1
-        if not ok:
+        status = "PASS"
+        if xfail:
+            status = "XFAIL" if not ok else "XPASS"
+        elif not ok:
+            status = "FAIL"
             failed += 1
-        print("%-6s  %-40s  %-6s  %s" % (
-            cid, name, "PASS" if ok else "FAIL", ""))
+        print("%-6s  %-40s  %-6s  %s" % (cid, name, status,
+              (": " + xfail) if xfail else ""))
         for label, passed, out in results:
             mark = "  [ok] " if passed else "  [!!] "
             print("  %s%s" % (mark, label))

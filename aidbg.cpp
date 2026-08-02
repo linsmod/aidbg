@@ -841,7 +841,19 @@ static bool ctx_display_base(CONTEXT& out)
 // to TitanEngine's reg_get, which is the authoritative value for the event thread)
 static ULONG_PTR ctx_reg(const CONTEXT& c, DWORD idx, bool is64)
 {
-    if (!is64) return reg_get(idx);
+    if (!is64) {
+        switch (idx) {
+            case UE_EAX: return c.Rax; case UE_EBX: return c.Rbx; case UE_ECX: return c.Rcx;
+            case UE_EDX: return c.Rdx; case UE_EDI: return c.Rdi; case UE_ESI: return c.Rsi;
+            case UE_EBP: return c.Rbp; case UE_ESP: return c.Rsp; case UE_EIP: return c.Rip;
+            case UE_EFLAGS: return c.EFlags;
+        }
+        for (int i = 0; i < 6; i++) if (SEG_IDX[i] == idx) {
+            switch (i) { case 0: return c.SegGs; case 1: return c.SegFs; case 2: return c.SegEs;
+                         case 3: return c.SegDs; case 4: return c.SegCs; case 5: return c.SegSs; }
+        }
+        return 0;
+    }
     switch (idx) {
         case UE_RAX: return c.Rax; case UE_RBX: return c.Rbx; case UE_RCX: return c.Rcx;
         case UE_RDX: return c.Rdx; case UE_RDI: return c.Rdi; case UE_RSI: return c.Rsi;
@@ -1549,7 +1561,7 @@ static bool eval_cond(const std::string& expr, bool& out)
 enum { BT_VOID=1, BT_CHAR=2, BT_WCHAR=3, BT_INT=6, BT_UINT=7, BT_FLOAT=8, BT_BOOL=10,
        BT_LONG=13, BT_ULONG=14, BT_HRESULT=31, BT_CHAR16=32, BT_CHAR32=33, BT_CHAR8=34 };
 // SymTagEnum / D3DATAKIND (cvconst.h)
-enum { STAG_DATA=7, STAG_BASETYPE=16 };
+enum { STAG_DATA=7, STAG_POINTER_TYPE=14, STAG_BASETYPE=16 };
 enum { DK_LOCAL=1, DK_STATIC_LOCAL=2, DK_PARAM=3, DK_GLOBAL=6 };
 
 struct ScopeVar {
@@ -1575,7 +1587,9 @@ static std::string bt_name(DWORD bt)
     }
 }
 
-// chase a symbol's type to its leaf base type + size (through refs/typedefs/pointers)
+// chase a symbol's type to its leaf base type + size (through refs/typedefs/pointers).
+// Pointers report their own width (4/8) so pointer args/locals are readable even
+// when the pointee is a UDT with no leaf base type.
 static bool sym_base_type(HANDLE h, ULONG64 modBase, DWORD typeIndex, DWORD& bt, DWORD& len)
 {
     DWORD tag = 0;
@@ -1585,6 +1599,11 @@ static bool sym_base_type(HANDLE h, ULONG64 modBase, DWORD typeIndex, DWORD& bt,
         DWORD l = 0;
         if (SymGetTypeInfo(h, modBase, typeIndex, TI_GET_LENGTH, &l)) len = l;
         return true;
+    }
+    if (tag == STAG_POINTER_TYPE) {
+        DWORD l = 0;
+        if (SymGetTypeInfo(h, modBase, typeIndex, TI_GET_LENGTH, &l) && l) { len = l; bt = 0; return true; }
+        // no length known; fall through and report the pointee instead
     }
     DWORD child = 0;
     if (SymGetTypeInfo(h, modBase, typeIndex, TI_GET_TYPE, &child) && child)
@@ -1642,23 +1661,24 @@ static bool scope_vars_for(const CONTEXT& c, bool is64, ULONG_PTR& frameBase,
     if (!g_sym_active || !g_sym_proc) return false;
     CONTEXT cc = c;   // frame_base_rsp mutates the context via RtlVirtualUnwind
     if (!frame_base_rsp(cc, is64, frameBase))
-        frameBase = is64 ? (ULONG_PTR)c.Rsp : (ULONG_PTR)reg_get(UE_ESP);
+        frameBase = (ULONG_PTR)c.Rsp;
     IMAGEHLP_STACK_FRAME sf = {};
-    sf.InstructionOffset = is64 ? c.Rip : (ULONG64)reg_get(UE_EIP);
+    sf.InstructionOffset = (DWORD64)c.Rip;
     sf.FrameOffset = frameBase;
-    sf.StackOffset = is64 ? c.Rsp : (ULONG64)reg_get(UE_ESP);
+    sf.StackOffset = (DWORD64)c.Rsp;
     if (!SymSetContext(g_sym_proc, &sf, nullptr)) {
         if (!SymSetScopeFromAddr(g_sym_proc, sf.InstructionOffset)) return false;
     }
     out.clear();
     if (!SymEnumSymbolsW(g_sym_proc, 0, nullptr, enum_scope_cb, &out)) return false;
     atEntry = false;
-    if (is64) {
+    {
         char b[sizeof(SYMBOL_INFOW) + MAX_SYM_NAME * sizeof(WCHAR)];
         PSYMBOL_INFOW si = (PSYMBOL_INFOW)b;
         si->SizeOfStruct = sizeof(SYMBOL_INFOW); si->MaxNameLen = MAX_SYM_NAME;
         DWORD64 disp = 0;
-        if (SymFromAddrW(g_sym_proc, (DWORD64)c.Rip, &disp, si)) atEntry = (disp == 0);
+        ULONG_PTR pc = (ULONG_PTR)c.Rip;
+        if (SymFromAddrW(g_sym_proc, (DWORD64)pc, &disp, si)) atEntry = (disp == 0);
     }
     return true;
 }
@@ -1680,8 +1700,17 @@ static bool local_lookup(const std::string& name, const CONTEXT& c, bool is64,
         ScopeVar* v = params[i];
         if (v->name != name) continue;
         unsigned long long vv = 0; ULONG_PTR at = 0;
-        if (atEntry && i < 4) vv = GetContextData(ARG_REGS[i]);
-        else if (!var_read(*v, frameBase, is64, vv, at)) continue;
+        if (atEntry && is64 && i < 4) {
+            vv = GetContextData(ARG_REGS[i]);
+        } else if (atEntry && !is64) {
+            // x86: params live on the stack at [ESP+4..] at function entry;
+            // dbghelp reports EBP-relative offsets -> address = ESP + off - 4
+            ULONG_PTR at_addr = (ULONG_PTR)c.Rsp + (LONG)v->addr - 4;
+            SIZE_T nr = 0;
+            SIZE_T n = (v->size && v->size <= 8) ? v->size : 4;
+            if (mem_read(at_addr, &vv, n, &nr) && nr >= n) { val = vv; addr = at_addr; size = v->size; return true; }
+            continue;
+        } else if (!var_read(*v, frameBase, is64, vv, at)) continue;
         val = vv; addr = at ? at : v->addr; size = v->size; return true;
     }
     for (auto* v : locals) {
@@ -2005,13 +2034,21 @@ static bool soft_error(const std::string& err)
 
 // -- info locals / info args (GDB) --
 
-// Compute the current frame's base (post-prolog RSP, or RBP when a frame pointer is
-// used) via RtlVirtualUnwind. MSVC x64 addresses locals relative to RSP, so without
-// this the variable offsets dbghelp reports are relative to 0 and unreadable.
+// Compute the current frame's base. For x64 this is the post-prolog RSP (or RBP
+// when a frame pointer is used) via RtlVirtualUnwind, because MSVC x64 addresses
+// locals relative to RSP. For x86 (WoW64) it is the EBP register: dbghelp reports
+// x86 local/param offsets relative to EBP for frame-pointer frames.
 // The unwind call is wrapped in SEH because it can fault on unusual frames; on
-// failure the caller falls back to the current RSP.
+// failure the caller falls back to the current stack pointer.
 static bool frame_base_rsp(CONTEXT& c, bool is64, ULONG_PTR& out)
 {
+    if (!is64) {
+        // x86 (WoW64): dbghelp reports local/param offsets relative to EBP for
+        // frame-pointer frames; use the selected frame's EBP (from `c`).
+        ULONG_PTR ebp = (ULONG_PTR)c.Rbp;
+        out = ebp ? ebp : (ULONG_PTR)c.Rsp;
+        return true;
+    }
     static auto RtlVirtualUnwindFn = (DWORD (WINAPI*)(ULONG, ULONG64, ULONG64, PRUNTIME_FUNCTION,
         PCONTEXT, PVOID*, PULONG64, PKNONVOLATILE_CONTEXT_POINTERS))
         GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlVirtualUnwind");
@@ -2045,13 +2082,13 @@ static CmdResult cmd_info_vars(bool args_only)
     if (frame_base_rsp(c, is64, frameBase)) {
         // fall through; frameBase is the established post-prolog frame pointer
     } else {
-        frameBase = is64 ? (ULONG_PTR)c.Rsp : (ULONG_PTR)reg_get(UE_ESP);
+        frameBase = is64 ? (ULONG_PTR)c.Rsp : (ULONG_PTR)c.Rsp;
     }
 
     IMAGEHLP_STACK_FRAME sf = {};
-    sf.InstructionOffset = is64 ? c.Rip : (ULONG64)reg_get(UE_EIP);
+    sf.InstructionOffset = (DWORD64)c.Rip;
     sf.FrameOffset = frameBase;
-    sf.StackOffset = is64 ? c.Rsp : (ULONG64)reg_get(UE_ESP);
+    sf.StackOffset = (DWORD64)c.Rsp;
 
     bool scoped = false;
     if (SymSetContext(g_sym_proc, &sf, nullptr)) scoped = true;
@@ -2063,16 +2100,18 @@ static CmdResult cmd_info_vars(bool args_only)
 
     // are we at the very first instruction of the enclosing function?
     bool atEntry = false;
-    if (is64) {
+    {
         char b[sizeof(SYMBOL_INFOW) + MAX_SYM_NAME * sizeof(WCHAR)];
         PSYMBOL_INFOW si = (PSYMBOL_INFOW)b;
         si->SizeOfStruct = sizeof(SYMBOL_INFOW); si->MaxNameLen = MAX_SYM_NAME;
         DWORD64 disp = 0;
-        if (SymFromAddrW(g_sym_proc, (DWORD64)c.Rip, &disp, si))
+        ULONG_PTR pc = (ULONG_PTR)c.Rip;
+        if (SymFromAddrW(g_sym_proc, (DWORD64)pc, &disp, si))
             atEntry = (disp == 0);
     }
 
-    // params are reported in home-slot order -> matches x64 register order
+    // params in declaration order (addr ascending) so the x64 register index is
+    // correct; the displayed list is then sorted by name (GDB does this too).
     std::vector<ScopeVar*> params;
     std::vector<ScopeVar*> locals;
     for (auto& v : vars) { (v.isParam ? params : locals).push_back(&v); }
@@ -2081,19 +2120,37 @@ static CmdResult cmd_info_vars(bool args_only)
 
     static const DWORD ARG_REGS[4] = { UE_RCX, UE_RDX, UE_R8, UE_R9 };
 
+    // declaration index per param (x64 passes the first 4 in RCX/RDX/R8/R9)
+    std::map<ScopeVar*, size_t> decl_idx;
+    for (size_t i = 0; i < params.size(); i++) decl_idx[params[i]] = i;
+
     std::ostringstream t, j;
     j << "[";
     int shown = 0;
     std::vector<ScopeVar*> sel = args_only ? params : locals;
+    std::sort(sel.begin(), sel.end(), [](ScopeVar* x, ScopeVar* y){ return x->name < y->name; });
     for (size_t idx = 0; idx < sel.size(); idx++) {
         ScopeVar* v = sel[idx];
         unsigned long long val = 0;
         ULONG_PTR at = 0;
         std::string valstr = "<unreadable>";
         bool ok = false;
-        if (args_only && v->isParam && atEntry && idx < 4) {
-            ok = true;   // value lives in the argument register at function entry
-            val = GetContextData(ARG_REGS[idx]);
+        if (args_only && v->isParam && atEntry) {
+            if (is64) {
+                size_t d = decl_idx[v];
+                if (d < 4) {
+                    ok = true;   // x64: value lives in the argument register at function entry
+                    val = GetContextData(ARG_REGS[d]);
+                }
+            } else {
+                // x86 (stdcall/cdecl/thiscall) params live on the stack; at entry
+                // they sit at [ESP+4] onward. dbghelp reports EBP-relative offsets,
+                // so the entry address is ESP + offset - 4 (the `push ebp` gap).
+                ULONG_PTR addr = (ULONG_PTR)c.Rsp + (LONG)v->addr - 4;
+                SIZE_T n = (v->size && v->size <= 8) ? v->size : 4;
+                SIZE_T nr = 0;
+                if (mem_read(addr, &val, n, &nr) && nr >= n) ok = true;
+            }
         } else if (var_read(*v, frameBase, is64, val, at)) {
             ok = true;
         }

@@ -31,15 +31,21 @@ import sys
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(HERE)          # repo root: aidbg.exe lives here
+ROOT = os.path.dirname(HERE)          # repo root
 CASES_DIR = os.path.join(HERE, "cases")
 SRC_DIR = os.path.join(HERE, "src")
-AIDBG = os.path.join(ROOT, "aidbg.exe")
+BUILD_BIN = os.path.join(ROOT, "build", "bin")
+AIDBG = os.path.join(BUILD_BIN, "aidbg.exe")
 BUILD_CMD = os.path.join(HERE, "build.cmd")
 PYTHON = sys.executable
 
 TARGETS = ["test_basic", "test_memory", "test_exception", "test_threads",
            "test_symbols", "test_attach", "test_checksum", "test_debugbreak"]
+
+# x86 (WoW64) targets are built with a separate script; aidbg (x64) debugs them
+# cross-architecture, which exercises the STATUS_WX86_BREAKPOINT path.
+X86_TARGETS = ["test_wow64"]
+BUILD_CMD_X86 = os.path.join(HERE, "build_x86.bat")
 
 # Never let the spawned aidbg / test targets pop their own console windows.
 # (The debuggee itself is additionally hidden via `set engine console on`,
@@ -65,6 +71,31 @@ def aidbg_run(script):
     """
     return run([AIDBG, "--batch", "-ex", "set engine console on", "-x", script],
                timeout=90)
+
+
+def ensure_aidbg():
+    """Ensure build/bin/aidbg.exe exists (and its TitanEngine.dll sibling).
+
+    aidbg is built by CMake (`cmake -S . -B build -A x64` +
+    `cmake --build build --config Release`), whose outputs live in build/bin.
+    The tests always run that freshly built binary. If it is missing the
+    runner configures and builds it here so `run_tests.py` is self-contained.
+    """
+    if os.path.isfile(AIDBG) and os.path.isfile(os.path.join(BUILD_BIN, "TitanEngine.dll")):
+        return
+    print("[runner] build/bin/aidbg.exe not found -> running CMake build")
+    rc, out = run(["cmake", "-S", ROOT, "-B", os.path.join(ROOT, "build"),
+                   "-A", "x64"], timeout=600)
+    if rc != 0:
+        print(out)
+        sys.exit("error: CMake configure failed")
+    rc, out = run(["cmake", "--build", os.path.join(ROOT, "build"),
+                   "--config", "Release"], timeout=1200)
+    if rc != 0:
+        print(out)
+        sys.exit("error: CMake build failed")
+    if not os.path.isfile(AIDBG):
+        sys.exit("error: aidbg.exe missing after build: %s" % AIDBG)
 
 
 def aidbg_session(cmds, marker="===AIDBG_MARKER===", timeout=90):
@@ -111,16 +142,37 @@ def aidbg_session_finish(proc, extra_cmds, timeout=90):
     return rest
 
 
-def ensure_targets():
-    """(Re)build the test targets via build.cmd if the exe is missing."""
-    missing = [t for t in TARGETS if not os.path.exists(os.path.join(ROOT, t + ".exe"))]
-    if not missing:
+def target_outdated(name):
+    """True when a test target's exe is missing or its source is newer."""
+    exe = os.path.join(ROOT, name + ".exe")
+    src = os.path.join(SRC_DIR, name + ".c")
+    if not os.path.exists(exe):
         return True
-    print("[runner] missing targets: %s -> running build.cmd" % ", ".join(missing))
-    rc, out = run(["cmd", "/c", BUILD_CMD], timeout=300)
-    if rc != 0:
-        print(out)
-        return False
+    return os.path.getmtime(src) > os.path.getmtime(exe)
+
+
+def ensure_targets(force=False):
+    """(Re)build the test targets if they are stale.
+
+    A target is stale when the exe is missing or the .c source is newer than
+    the exe (so editing a test program recompiles it automatically). `force`
+    rebuilds everything regardless of timestamps. x64 targets use build.cmd;
+    x86 (WoW64) targets use build_x86.bat.
+    """
+    stale_x64 = TARGETS if force else [t for t in TARGETS if target_outdated(t)]
+    if stale_x64:
+        print("[runner] building x64 targets: %s" % ", ".join(stale_x64))
+        rc, out = run(["cmd", "/c", BUILD_CMD], timeout=300)
+        if rc != 0:
+            print(out)
+            return False
+    stale_x86 = X86_TARGETS if force else [t for t in X86_TARGETS if target_outdated(t)]
+    if stale_x86:
+        print("[runner] building x86 targets: %s" % ", ".join(stale_x86))
+        rc, out = run(["cmd", "/c", BUILD_CMD_X86], timeout=300)
+        if rc != 0:
+            print(out)
+            return False
     return True
 
 
@@ -494,6 +546,12 @@ CASES = [
         "expect": None,
         "dynamic": "debugbreak",
     },
+    {
+        "id": "4.16",
+        "name": "32-bit (WoW64) breakpoint continuation",
+        "script": "case_4_16_wow64_bp.txt",
+        "expect": ["Stopped: breakpoint", "wow_target", "hit 3", "Stopped: step"],
+    },
 ]
 
 
@@ -512,14 +570,13 @@ def run_case(case):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--no-build", action="store_true")
+    ap.add_argument("--force-build", action="store_true")
     ap.add_argument("--keep", action="store_true")
     ap.add_argument("--case", default=None)
     args = ap.parse_args()
 
-    if not os.path.exists(AIDBG):
-        print("error: %s not found" % AIDBG)
-        return 1
-    if not args.no_build and not ensure_targets():
+    ensure_aidbg()
+    if not args.no_build and not ensure_targets(force=args.force_build):
         print("error: failed to build targets")
         return 1
 

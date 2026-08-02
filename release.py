@@ -20,17 +20,17 @@ repo root (or anywhere; the script locates itself).
 import argparse
 import datetime
 import os
-import shutil
 import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 AIDBG_CPP = os.path.join(HERE, "aidbg.cpp")
-AIDBG_EXE = os.path.join(HERE, "aidbg.exe")
-TITAN_DLL = os.path.join(HERE, "TitanEngine.dll")
 BUILD_DIR = os.path.join(HERE, "build")
 BUILD_BIN = os.path.join(BUILD_DIR, "bin")
+AIDBG_EXE = os.path.join(BUILD_BIN, "aidbg.exe")
+TITAN_DLL = os.path.join(BUILD_BIN, "TitanEngine.dll")
 TEST_BUILD = os.path.join(HERE, "tests", "build.cmd")
+TEST_BUILD_X86 = os.path.join(HERE, "tests", "build_x86.bat")
 TEST_RUN = os.path.join(HERE, "tests", "run_tests.py")
 
 def log(msg):
@@ -93,13 +93,11 @@ def build_aidbg():
     if rc != 0:
         fail("CMake build failed\n" + out[-2000:])
 
-    for name, destination in (("aidbg.exe", AIDBG_EXE),
-                              ("TitanEngine.dll", TITAN_DLL)):
+    for name in ("aidbg.exe", "TitanEngine.dll"):
         source = os.path.join(BUILD_BIN, name)
         if not os.path.isfile(source):
             fail("CMake output missing: %s" % source)
-        shutil.copy2(source, destination)
-    log("aidbg.exe and TitanEngine.dll built")
+    log("aidbg.exe and TitanEngine.dll built in build/bin")
 
 
 def build_tests(vcvars):
@@ -109,6 +107,7 @@ def build_tests(vcvars):
         f.write('@echo off\r\n')
         f.write('call "%s" >nul 2>&1\r\n' % vcvars)
         f.write('call "%s"\r\n' % TEST_BUILD)
+        f.write('call "%s"\r\n' % TEST_BUILD_X86)
     try:
         rc, out = run(["cmd", "/c", build_cmd], timeout=600)
         if rc != 0:

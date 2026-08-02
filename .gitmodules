@@ -1,3 +1,4 @@
 [submodule "third_party/TitanEngine"]
 	path = third_party/TitanEngine
 	url = ../../x64dbg/TitanEngine
+	shallow = true

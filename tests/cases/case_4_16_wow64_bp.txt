@@ -1,0 +1,20 @@
+# Case 4.16 - 32-bit (WoW64) breakpoint continuation (TestGuid.md section 4.16)
+# Target: test_wow64.exe (x86, built by tests/build_x86.bat)
+# Background: aidbg is x64; under WoW64 an int3 software breakpoint surfaces as
+#   STATUS_WX86_BREAKPOINT (0x4000001f) instead of STATUS_BREAKPOINT (0x80000003).
+#   TitanEngine must consume it so `continue` advances instead of re-stopping on
+#   the same address forever.
+# Expected:
+#   - `start` stops at main (temporary breakpoint 1)
+#   - `break wow_target` (id 2) stops each of the 3 loop iterations
+#   - `continue` moves past the breakpoint (no duplicate stop on the same address)
+#   - `stepi` advances within the 32-bit target
+file test_wow64.exe
+start
+break wow_target
+continue
+continue
+continue
+continue
+stepi 2
+quit

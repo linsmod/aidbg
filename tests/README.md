@@ -17,6 +17,7 @@ tests/
     test_attach.c      常驻目标：供 attach/detach 测试
   cases/               各测试用例的 aidbg 命令脚本（TestGuid.md 第 4 节）
   build.cmd            MSVC 编译脚本（方案 B 专用参数，见下）
+  build_x86.bat        x86 (WoW64) 目标编译脚本（test_wow64.exe）
   run_tests.py         Python 测试运行器
   run_tests.cmd        run_tests.py 的 cmd 封装
 ```
@@ -72,6 +73,7 @@ cl /nologo /Zi /Od /Oy- /GS- /MTd /Fe:<target>.exe <target>.c /link /DEBUG:FULL 
 | 4.13 | `case_4_13_info_files.txt` | `info files`（符号/入口/加载文件） | `Symbols from ...`、`Entry point: 0x...` |
 | 4.14 | （运行器动态驱动） | 源码/PDB 校验（`info source`、list 警告） | 源未改动 `Checksum: ok`；篡改后 `mismatch` + `!! Checksum mismatch`（仅开关开启时） |
 | 4.15 | （运行器动态驱动） | breakpoint continue 状态 | `DebugBreak()` 被 aidbg 消费；`RaiseException(STATUS_BREAKPOINT)` 仍进入 SEH |
+| 4.16 | `case_4_16_wow64_bp.txt` | 32 位（WoW64）断点延续 | x86 目标 `break wow_target` 命中 3 次、`continue` 推进、`stepi` 正常 |
 
 > **断点编号**：`start` 的一次性入口断点占用 id 1（GDB 一致），因此 4.2/4.2b 的
 > `break func1` 为 id 2、4.9 的 `break add` 为 id 2，脚本与断言均已按此编号。
@@ -93,6 +95,10 @@ cl /nologo /Zi /Od /Oy- /GS- /MTd /Fe:<target>.exe <target>.c /link /DEBUG:FULL 
   `continue` 时通过 `SetNextDbgContinueStatus(DBG_CONTINUE)` 消费异常并正常续跑；
   `RaiseException(STATUS_BREAKPOINT)` 保持 `DBG_EXCEPTION_NOT_HANDLED`，由被调试程序的
   SEH 处理。两条路径都断言没有同一事件的重复回调，并由 `finally` 清理标记文件。
+- **4.16**：`test_wow64.exe`（x86，`build_x86.bat` 编译）验证 WoW64 交叉调试下的软件
+  断点：aidbg 为 x64，32 位目标的 `int3` 以 `STATUS_WX86_BREAKPOINT`（0x4000001f）
+  上报，TitanEngine 需消费该断点。断言 `break wow_target` 命中 3 次（无重复回调）、
+  `continue` 正常推进、`stepi` 可单步。
 
 ## 与 TestGuid.md 的差异说明（实现现实）
 

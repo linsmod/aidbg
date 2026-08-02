@@ -275,7 +275,23 @@ aidbg --batch -ex "file test_basic.exe" -ex "run" -ex "strings main" -ex "search
 **预期**：
 - `strings` 输出可打印字符串，`search` 找到 "Hello" 的地址。
 
----
+### 4.16 32 位（WoW64）断点延续
+
+aidbg 以 x64 构建，但需能调试 32 位（x86）目标。在 WoW64 下，软件断点 `int3`
+以 `STATUS_WX86_BREAKPOINT`（`0x4000001f`）上报，而不是 64 位的
+`STATUS_BREAKPOINT`（`0x80000003`）。调试器必须消费该断点：命中一次、`continue`
+推进，而非反复停在同一地址（重复回调）。
+
+```bash
+tests\build_x86.bat
+aidbg --batch -ex "file test_wow64.exe" -ex "start" -ex "break wow_target" -ex "continue" -ex "continue" -ex "continue" -ex "stepi 2" -ex "quit"
+```
+**预期**：
+- `start` 停在 `main`（临时断点 id 1）。
+- `break wow_target`（id 2）在循环 3 次迭代中命中 3 次，显示 `Stopped: breakpoint`。
+- `continue` 每次越过断点并前进（无同一地址的重复停止）。
+- `stepi 2` 在 32 位目标上正常单步。
+
 
 ## 5. 测试程序编译策略（分层构建）
 

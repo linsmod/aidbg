@@ -167,6 +167,7 @@ registers(regs) / set / x / dump / disas(u) / bt / search / strings / list
 info break / threads / modules / proc / files / locals / args / events / source / registers
 set engine <aslr|console|passexc> on/off
 set source-checksum on|off / show source-checksum
+set pagination on|off / show pagination
 echo / help / quit(q)
 ```
 
@@ -208,7 +209,7 @@ end-to-end walkthrough of the man-page core commands, 4.22 checks CLI batch sema
 
 ### Stack / Threads
 
-| `bt` / `where` | Backtrace | Same (StackWalk64, works on optimized builds) | ✅ | 4.1/4.21 |
+| `bt` / `where` | Backtrace | Same (StackWalk64; frames shown as `module!func+off (file:line)`; works on optimized builds and on WOW64 32-bit targets) | ✅ | 4.1/4.21 |
 | `info locals` / `info args` | Local variables / function arguments | Same (needs a full PDB, see Known limitations) | ✅ | 4.6 |
 | `thread <id>` | Switch threads | Same (internal number or OS TID) | ✅ | 4.7b |
 | `info threads` | List threads | Same (`*` marks the current thread) | ✅ | 4.7 |
@@ -232,6 +233,7 @@ end-to-end walkthrough of the man-page core commands, 4.22 checks CLI batch sema
 ### Disassembly / Misc
 
 | `disas` / `disassemble [start,end]` | Disassemble | Same (GDB range syntax, symbols supported) | ✅ | 4.5/4.25 |
+| `set pagination on\|off` / `show pagination` | Toggle GDB-style paging | Same (interactive REPL only; never pages in batch / `--command` / JSON / piped modes) | ✅ | — |
 | `help` / `quit` / `echo` | Help / quit / output | Same | ✅ | — |
 | `dump` / `search` / `strings` / `info modules\|events\|proc` | — | aidbg extensions | ⓘ | 4.10 |
 
@@ -269,7 +271,8 @@ tests\run_tests.cmd        :: green, returns 0, CI-ready
 - [ ] **AI interface enhancements**: long-lived `--host/--port` socket protocol (multiple
   commands per session, no per-command process spawn); richer JSON (dump/x byte arrays,
   fuller breakpoint fields)
-- [ ] **Engine stability & edges**: WOW64 32-bit unwinding for `info locals`/`bt`/`thread`;
+- [ ] **Engine stability & edges**: WOW64 32-bit unwinding for `info locals`/`thread`
+  (`bt` done — StackWalk64 on a packed x86 context, cases 4.16/4.18);
   `list` with non-ASCII source paths (wide-char open); `set scheduler-locking on|off`
 - [ ] **Advanced breakpoints**: `commands <id>` breakpoint command lists (auto-continue,
   etc.); `until` / `advance <loc>` run-to-location
@@ -294,7 +297,12 @@ tests\run_tests.cmd        :: green, returns 0, CI-ready
 - Source-level `step`/`next` are implemented (`archive/handover5.md`); without PDB line
   info they fall back to instruction stepping (`stepi`/`nexti`) with a notice.
 - 32-bit (WOW64) targets are supported (software/hardware breakpoints, single-step;
-  cases 4.16–4.18).
+  cases 4.16–4.18). `bt` unwinds them via `StackWalk64` fed an x86-layout
+  `WOW64_CONTEXT` (previously the AMD64-layout mismatch stopped the walk after frame 0).
+- `bt` reports only frames the unwinder derives from metadata (x64 `.pdata` / x86 FPO +
+  EBP chain); it does not raw-scan the stack, so no guessed frames are shown. Where the
+  unwind metadata runs out (e.g. re-entrant dispatch inside a WoW64 message pump) the
+  list simply ends there.
 - `info locals` variable enumeration on `/DEBUG:FASTLINK` or `/O2` builds is limited by a
   dbghelp limitation.
 - **ASLR disabling is unreliable (TitanEngine engine limitation)**: `set engine aslr off`

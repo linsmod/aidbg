@@ -34,6 +34,7 @@
 // before `run` and are armed (pending) when the target starts.
 
 #include <windows.h>
+#include <winternl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -187,6 +188,8 @@ static bool g_json = false;                 // JSON machine output
 static bool g_batch = false;                // GDB --batch: run()-continues past the initial break
 static bool g_quiet = false;                // -q: suppress startup banner
 static bool g_silent = false;               // --batch-silent: suppress all aidbg output
+static bool g_pagination = true;            // GDB `set pagination on|off` (interactive pager)
+static bool g_interactive = false;          // REPL with console stdin+stdout (pager active)
 static std::string g_target;                // target exe path
 static std::wstring g_target_w;
 static std::string g_default_args;          // inferior args from --args / set args (used by bare "run")
@@ -1703,6 +1706,41 @@ static std::string resolve(ULONG_PTR addr)
     return "";
 }
 
+// base module name (e.g. "mshtml.exe") containing an address, or "" if unknown
+static std::string module_name_for(ULONG_PTR addr)
+{
+    if (g_sym_active && g_sym_proc) {
+        ULONG64 base = SymGetModuleBase64(g_sym_proc, (DWORD64)addr);
+        if (base) {
+            IMAGEHLP_MODULEW64 mi = {};
+            mi.SizeOfStruct = sizeof(IMAGEHLP_MODULEW64);
+            if (SymGetModuleInfoW64(g_sym_proc, base, &mi)) {
+                std::string n = utf8(mi.ImageName);
+                if (n.empty()) n = utf8(mi.ModuleName);
+                size_t slash = n.find_last_of("\\/");
+                if (slash != std::string::npos) n = n.substr(slash + 1);
+                if (!n.empty()) return n;
+            }
+        }
+    }
+    if (g_mods.empty()) modules_refresh();
+    for (auto& m : g_mods) {
+        if (addr >= m.base && addr < m.base + 0x10000000) return m.name;
+    }
+    return "";
+}
+
+// GDB/WinDbg-style "module!func+0x12 (file.c:line)" for a backtrace frame
+static std::string resolve_bt(ULONG_PTR addr)
+{
+    std::string r = resolve(addr);
+    if (r.empty()) return r;
+    std::string mod = module_name_for(addr);
+    if (!mod.empty() && r.compare(0, mod.size(), mod) != 0)
+        r = mod + "!" + r;
+    return r;
+}
+
 // GDB-style location for the stop banner: "func () at file.c:line" when symbols
 // are available, else fall back to resolve().  e.g.
 //   Temporary breakpoint 1, main () at test_basic.c:29
@@ -1883,6 +1921,50 @@ struct CmdResult {
     std::string js;     // json "result" payload (empty => nothing)
 };
 
+// GDB-style pager: in the interactive REPL with `set pagination on`, long output
+// is shown a screenful at a time; Enter continues, q quits the rest. Never pages
+// in batch / JSON / piped modes (GDB disables pagination there too).
+static int term_height()
+{
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    if (h != INVALID_HANDLE_VALUE && GetConsoleScreenBufferInfo(h, &csbi))
+        return csbi.srWindow.Bottom - csbi.srWindow.Top + 1;
+    return 0;
+}
+
+static void page_out(const std::string& text)
+{
+    if (text.empty()) return;
+    if (!g_interactive || !g_pagination) { printf("%s\n", text.c_str()); return; }
+
+    int per = term_height();
+    if (per < 2) per = 24;                  // unknown console: default page size
+    else per -= 1;                          // leave the last line for the prompt
+
+    std::vector<std::string> lines;
+    size_t p = 0;
+    while (p < text.size()) {
+        size_t e = text.find('\n', p);
+        if (e == std::string::npos) { lines.push_back(text.substr(p)); break; }
+        lines.push_back(text.substr(p, e - p));
+        p = e + 1;
+    }
+    size_t idx = 0;
+    while (idx < lines.size()) {
+        size_t upto = (std::min)(lines.size(), idx + (size_t)per);
+        for (; idx < upto; idx++) printf("%s\n", lines[idx].c_str());
+        fflush(stdout);
+        if (idx >= lines.size()) break;
+        printf("--Type <return> for more, q to quit--\n");
+        fflush(stdout);
+        std::string resp;
+        if (!std::getline(std::cin, resp)) break;
+        for (auto& c : resp) c = (char)tolower((unsigned char)c);
+        if (resp.find('q') != std::string::npos) break;
+    }
+}
+
 static void print_result(const CmdResult& r)
 {
     if (g_silent) {
@@ -1900,7 +1982,7 @@ static void print_result(const CmdResult& r)
         }
         printf("%s\n", o.str().c_str());
     } else if (r.ok) {
-        if (!r.text.empty()) printf("%s\n", r.text.c_str());
+        if (!r.text.empty()) page_out(r.text);
     } else {
         printf("error: %s\n", r.err.c_str());
     }
@@ -3057,9 +3139,48 @@ static CmdResult cmd_disas(const std::vector<std::string>& args)
     return cr;
 }
 
+// convert an x86-layout WOW64_CONTEXT back to the AMD64-layout CONTEXT that
+// g_frames/registers expect (32-bit values kept in the low DWORD slots)
+static CONTEXT wctx_to_ctx(const WOW64_CONTEXT& w)
+{
+    CONTEXT c = {};
+    c.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS;
+    c.Rax = w.Eax; c.Rbx = w.Ebx; c.Rcx = w.Ecx; c.Rdx = w.Edx;
+    c.Rdi = w.Edi; c.Rsi = w.Esi; c.Rbp = w.Ebp; c.Rsp = w.Esp; c.Rip = w.Eip;
+    c.EFlags = w.EFlags;
+    c.SegGs = (WORD)w.SegGs; c.SegFs = (WORD)w.SegFs; c.SegEs = (WORD)w.SegEs;
+    c.SegDs = (WORD)w.SegDs; c.SegCs = (WORD)w.SegCs; c.SegSs = (WORD)w.SegSs;
+    c.Dr0 = w.Dr0; c.Dr1 = w.Dr1; c.Dr2 = w.Dr2; c.Dr3 = w.Dr3;
+    c.Dr6 = w.Dr6; c.Dr7 = w.Dr7;
+    return c;
+}
+
+// pack the 32-bit register state of a WoW64 thread into an x86-layout
+// WOW64_CONTEXT for StackWalk64 (the AMD64-layout CONTEXT in `base` carries the
+// 32-bit values in the low DWORDs; the x86 CONTEXT field offsets differ)
+static WOW64_CONTEXT ctx32_from_base(const CONTEXT& base, ULONG_PTR pc)
+{
+    WOW64_CONTEXT w = {};
+    w.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS;
+    w.Edi = (DWORD)base.Rdi; w.Esi = (DWORD)base.Rsi;
+    w.Ebx = (DWORD)base.Rbx; w.Edx = (DWORD)base.Rdx;
+    w.Ecx = (DWORD)base.Rcx; w.Eax = (DWORD)base.Rax;
+    w.Ebp = (DWORD)base.Rbp; w.Eip = (DWORD)pc; w.Esp = (DWORD)base.Rsp;
+    w.EFlags = (DWORD)base.EFlags;
+    w.Dr0 = (DWORD)base.Dr0; w.Dr1 = (DWORD)base.Dr1; w.Dr2 = (DWORD)base.Dr2; w.Dr3 = (DWORD)base.Dr3;
+    w.Dr6 = (DWORD)base.Dr6; w.Dr7 = (DWORD)base.Dr7;
+    w.SegGs = base.SegGs; w.SegFs = base.SegFs; w.SegEs = base.SegEs;
+    w.SegDs = base.SegDs; w.SegCs = base.SegCs; w.SegSs = base.SegSs;
+    if (!w.SegCs) w.SegCs = 0x23;   // 32-bit user-mode selectors
+    if (!w.SegSs) w.SegSs = 0x2B;
+    return w;
+}
+
 // -- backtrace (StackWalk64; works regardless of frame-pointer omission) --
 // walk the stack and cache per-frame contexts (for GDB `frame`/`up`/`down`).
 // Returns the frame pcs; on success g_frames has one FrameInfo per frame.
+// Only frames StackWalk64 computed from unwind metadata are reported; no raw
+// stack scanning, so the list stays free of guessed frames.
 static bool bt_walk(int max, std::vector<ULONG_PTR>& addrs)
 {
     addrs.clear();
@@ -3094,11 +3215,19 @@ static bool bt_walk(int max, std::vector<ULONG_PTR>& addrs)
     HANDLE hth = NULL;
     if (!is64) hth = OpenThread(THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, tid);
 
-    CONTEXT walk_ctx = base;
+    // StackWalk64 must be fed a context whose layout matches the machine type.
+    // For a WoW64 (32-bit) target the live register values sit in an AMD64
+    // CONTEXT; pack them into an x86-layout WOW64_CONTEXT or the unwinder reads
+    // Eip/Esp from the wrong offsets and dies after frame 0.
+    CONTEXT walk_ctx64 = base;
+    WOW64_CONTEXT walk_ctx32 = {};
+    if (!is64) walk_ctx32 = ctx32_from_base(base, base_pc);
+
     bool first = true;
     std::set<ULONG_PTR> seen; seen.insert(base_pc);
     for (int i = 1; i < max; i++) {
-        if (!StackWalk64(mach, pi->hProcess, hth, &sf, &walk_ctx, NULL,
+        PVOID walk_ctx = is64 ? (PVOID)&walk_ctx64 : (PVOID)&walk_ctx32;
+        if (!StackWalk64(mach, pi->hProcess, hth, &sf, walk_ctx, NULL,
                          SymFunctionTableAccess64, SymGetModuleBase64, NULL))
             break;
         ULONG_PTR pc = (ULONG_PTR)sf.AddrPC.Offset;
@@ -3110,11 +3239,15 @@ static bool bt_walk(int max, std::vector<ULONG_PTR>& addrs)
         }
         if (seen.count(pc)) break;   // unwinder loop guard
         seen.insert(pc);
-        FrameInfo fi; fi.ctx = walk_ctx; fi.pc = pc; fi.frameBase = 0;
-        if (is64) { CONTEXT cc = walk_ctx; frame_base_rsp(cc, true, fi.frameBase); }
+        FrameInfo fi; fi.pc = pc; fi.frameBase = 0;
+        if (is64) {
+            fi.ctx = walk_ctx64;
+            CONTEXT cc = walk_ctx64; frame_base_rsp(cc, true, fi.frameBase);
+        } else {
+            fi.ctx = wctx_to_ctx(walk_ctx32);
+        }
         g_frames.push_back(fi);
         addrs.push_back(pc);
-        if (!sf.AddrReturn.Offset) break;
     }
     if (hth) CloseHandle(hth);
     return true;
@@ -3123,8 +3256,17 @@ static bool bt_walk(int max, std::vector<ULONG_PTR>& addrs)
 static CmdResult cmd_bt(const std::vector<std::string>& args)
 {
     if (!require_running()) return {false, "no active debug session"};
-    int max = args.empty() ? 64 : atoi(args[0].c_str());
-    if (max <= 0) max = 64;      // tolerate GDB's "bt full" etc.
+    int max = 64;
+    if (!args.empty()) {
+        std::string a0 = args[0];
+        std::transform(a0.begin(), a0.end(), a0.begin(), ::tolower);
+        if (a0 == "full" || a0 == "all") {
+            max = 64;                        // GDB's "bt full": same frames, no scan
+        } else {
+            max = atoi(a0.c_str());
+            if (max <= 0) max = 64;
+        }
+    }
     if (max > 256) max = 256;
 
     std::vector<ULONG_PTR> addrs;
@@ -3135,7 +3277,7 @@ static CmdResult cmd_bt(const std::vector<std::string>& args)
     for (size_t i = 0; i < addrs.size(); i++) {
         ULONG_PTR a = addrs[i];
         if (i) j << ",";
-        std::string r = resolve(a);
+        std::string r = resolve_bt(a);
         j << "{\"frame\":" << i << ",\"rip\":\"" << hex(a) << "\",\"symbol\":\""
           << js_str(r) << "\"}";
         o << "#" << i << "  " << hex(a) << " in " << (r.empty() ? "??" : r) << "\n";
@@ -3651,6 +3793,26 @@ static CmdResult cmd_show_checksum()
     return cr;
 }
 
+// -- pagination toggle / query (GDB) --
+static CmdResult cmd_set_pagination(const std::vector<std::string>& args)
+{
+    if (args.empty()) return {false, "usage: set pagination on|off"};
+    bool on = args[0] == "on" || args[0] == "1" || args[0] == "true";
+    g_pagination = on;
+    CmdResult cr;
+    cr.js = std::string("{\"pagination\":") + (on ? "true" : "false") + "}";
+    cr.text = std::string("pagination = ") + (on ? "on" : "off");
+    return cr;
+}
+
+static CmdResult cmd_show_pagination()
+{
+    CmdResult cr;
+    cr.js = std::string("{\"pagination\":") + (g_pagination ? "true" : "false") + "}";
+    cr.text = std::string("pagination = ") + (g_pagination ? "on" : "off");
+    return cr;
+}
+
 // `info source`: current stop's source file + PDB checksum verification.
 // Always verifies (explicit diagnostic), regardless of the source-checksum toggle.
 static CmdResult cmd_info_source()
@@ -3737,6 +3899,8 @@ static const char* HELP =
 "  set engine <var> on|off     aslr / disable-randomization / console / passexc\n"
 "  set source-checksum on|off  verify source files against PDB checksums (default off)\n"
 "  show source-checksum        show the source-checksum toggle\n"
+"  set pagination on|off       page long output in the interactive REPL (default on)\n"
+"  show pagination             show the pagination toggle\n"
 "  help / quit / q\n";
 
 static CmdResult cmd_help()
@@ -3839,12 +4003,16 @@ static CmdResult execute(const std::string& line)
         if (tok.size() >= 2 && tok[1] == "source-checksum") {
             return cmd_set_checksum(std::vector<std::string>(tok.begin()+2, tok.end()));
         }
+        if (tok.size() >= 2 && tok[1] == "pagination") {
+            return cmd_set_pagination(std::vector<std::string>(tok.begin()+2, tok.end()));
+        }
         return cmd_set(std::vector<std::string>(tok.begin()+1, tok.end()));
     }
     if (cmd == "show") {
-        if (tok.size() < 2) return {false, "usage: show args|source-checksum"};
+        if (tok.size() < 2) return {false, "usage: show args|source-checksum|pagination"};
         if (tok[1] == "args") return cmd_show_args();
         if (tok[1] == "source-checksum") return cmd_show_checksum();
+        if (tok[1] == "pagination") return cmd_show_pagination();
         return {false, "unknown show topic: " + tok[1]};
     }
     if (cmd == "print" || cmd == "p") {
@@ -4094,6 +4262,7 @@ int main(int argc, char** argv)
 
     // interactive REPL
     if (g_target.empty() && !g_quiet) printf("%s", HELP);
+    g_interactive = _isatty(_fileno(stdout)) != 0;   // stdin is a tty here; page only to a console
     std::string line;
     while (true) {
         printf("(aidbg) ");

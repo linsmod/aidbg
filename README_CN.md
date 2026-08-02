@@ -157,6 +157,7 @@ registers(regs) / set / x / dump / disas(u) / bt / search / strings / list
 info break / threads / modules / proc / files / locals / args / events / source / registers
 set engine <aslr|console|passexc> on/off
 set source-checksum on|off / show source-checksum
+set pagination on|off / show pagination
 echo / help / quit(q)
 ```
 
@@ -197,7 +198,7 @@ echo / help / quit(q)
 
 ### 栈与线程（Stack / Threads）
 
-| `bt` / `where` | 栈回溯 | 同左（StackWalk64，优化构建可用） | ✅ | 4.1/4.21 |
+| `bt` / `where` | 栈回溯 | 同左（StackWalk64；帧显示为 `module!func+off (file:line)`；优化构建与 WOW64 32 位目标均可用） | ✅ | 4.1/4.21 |
 | `info locals` / `info args` | 局部变量 / 函数参数 | 同左（需完整 PDB，见已知边界） | ✅ | 4.6 |
 | `thread <id>` | 切换线程 | 同左（内部编号或 OS TID） | ✅ | 4.7b |
 | `info threads` | 列出线程 | 同左（`*` 标当前线程） | ✅ | 4.7 |
@@ -221,6 +222,7 @@ echo / help / quit(q)
 ### 反汇编与工具（Disassembly / Misc）
 
 | `disas` / `disassemble [start,end]` | 反汇编 | 同左（GDB 区间语法，支持符号） | ✅ | 4.5/4.25 |
+| `set pagination on\|off` / `show pagination` | 开关 GDB 式分页 | 同左（仅交互 REPL；batch / `--command` / JSON / 管道模式不分页） | ✅ | — |
 | `help` / `quit` / `echo` | 帮助 / 退出 / 输出 | 同左 | ✅ | — |
 | `dump` / `search` / `strings` / `info modules\|events\|proc` | — | aidbg 独有扩展 | ⓘ | 4.10 |
 
@@ -254,7 +256,8 @@ tests\run_tests.cmd        :: 全绿返回 0，可接入 CI
   局部变量与算术表达式；`frame`/`up`/`down` 帧导航（用例 4.26–4.29）
 - [ ] **AI 接口增强**：`--host/--port` 长驻 socket 协议（一次会话多命令，免每次
   启动进程）；JSON 结构化增强（dump/x 字节数组、断点字段补全）
-- [ ] **引擎稳定与边界**：WOW64 下 `info locals`/`bt`/`thread` 的 32 位展开验证；
+- [ ] **引擎稳定与边界**：WOW64 下 `info locals`/`thread` 的 32 位展开验证
+  （`bt` 已完成——x86 布局上下文喂 StackWalk64，用例 4.16/4.18）；
   `list` 支持非 ASCII 源文件路径（宽字符打开）；`set scheduler-locking on|off`
 - [ ] **断点高级**：`commands <id>` 断点命令列表（自动 continue 等）；
   `until` / `advance <loc>` 运行到指定位置
@@ -276,7 +279,11 @@ tests\run_tests.cmd        :: 全绿返回 0，可接入 CI
   `break`/`list`/`hbreak`/`watch`/`mbreak`/`condition` 亦支持。
 - 源码级 `step`/`next` 已实现（`archive/handover5.md`）；无 PDB 行号时回退指令级单步
   （`stepi`/`nexti`）并提示。
-- 32 位（WOW64）目标已支持（软件/硬件断点、单步；用例 4.16–4.18）。
+- 32 位（WOW64）目标已支持（软件/硬件断点、单步；用例 4.16–4.18）。`bt` 通过把寄存器
+  打包成 x86 布局的 `WOW64_CONTEXT` 再交给 `StackWalk64` 展开（此前 AMD64 布局不匹配导致
+  回溯在 #0 后即中断）。
+- `bt` 只显示展开器从元数据（x64 `.pdata` / x86 FPO + EBP 链）得到的帧，不做裸栈扫描，
+  因此没有猜测帧。展开元数据耗尽处（如 WOW64 消息泵内的重入分发）列表即到此为止。
 - `info locals` 对 `/DEBUG:FASTLINK` 或 `/O2` 构建的变量枚举受 dbghelp 物理限制。
 - **ASLR 关闭不可靠（TitanEngine 引擎限制）**：`set engine aslr off`（或 GDB 对齐别名
   `set engine disable-randomization on`）映射到 `UE_ENGINE_DISABLE_ASLR`，依赖 TitanEngine

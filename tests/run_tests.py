@@ -480,13 +480,13 @@ CASES = [
         "id": "4.1",
         "name": "start stops at main / backtrace",
         "script": "case_4_1_basic_break.txt",
-        "expect": ["Temporary breakpoint 1, main", "Stopped: breakpoint", "in main"],
+        "expect": ["Temporary breakpoint 1, main", "Stopped: breakpoint", "test_basic.exe!main"],
     },
     {
         "id": "4.1b",
         "name": "pending break before run (GDB-style)",
         "script": "case_4_1b_pending_break.txt",
-        "expect": ["pending", "Breakpoint 1, main () at test_basic.c:29", "in main"],
+        "expect": ["pending", "Breakpoint 1, main () at test_basic.c:29", "test_basic.exe!main"],
     },
     {
         "id": "4.2",
@@ -542,7 +542,7 @@ CASES = [
         "id": "4.9",
         "name": "symbol break / list / bt",
         "script": "case_4_9_symbols_list.txt",
-        "expect": ["Breakpoint 2, add", "test_symbols.c", "in add"],
+        "expect": ["Breakpoint 2, add", "test_symbols.c", "test_symbols.exe!add"],
     },
     {
         "id": "4.10",
@@ -631,7 +631,7 @@ CASES = [
         "name": "GDB command compatibility (start/step/next/bt/finish/list)",
         "script": "case_4_21_gdb_compat2.txt",
         "expect": ["Temporary breakpoint 1, main", "Breakpoint 2, main () at test_source_step.c:29",
-                   "callee (test_source_step.c:15)", "in callee", "main+0x1b", ">   29"],
+                   "callee (test_source_step.c:15)", "test_source_step.exe!callee", "main+0x1b", ">   29"],
     },
     {
         "id": "4.22",

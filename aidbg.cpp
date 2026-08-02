@@ -3891,8 +3891,40 @@ static CmdResult execute(const std::string& line)
 
 struct BatchItem { std::string text; bool is_file; };
 
+// When aidbg.exe is launched through a symlink (e.g. winget portable links
+// WinGet\Links\aidbg.exe -> ...\Packages\aidbg.exe), the Windows loader searches
+// the symlink's directory for dependent DLLs, not the target's, so the
+// TitanEngine.dll next to the real exe would not be found. TitanEngine.dll is
+// delay-loaded; resolve the real module directory and put it on the DLL search
+// path before the first engine call.
+static void ensure_engine_dll_search_path()
+{
+    wchar_t path[32768];
+    DWORD n = GetModuleFileNameW(NULL, path, (DWORD)_countof(path));
+    if (n == 0 || n >= _countof(path))
+        return;
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE)
+        return;
+    DWORD m = GetFinalPathNameByHandleW(h, path, (DWORD)_countof(path),
+                                        FILE_NAME_NORMALIZED);
+    CloseHandle(h);
+    if (m == 0 || m >= _countof(path))
+        return;
+    wchar_t* slash = wcsrchr(path, L'\\');
+    if (!slash)
+        return;
+    *slash = L'\0';
+    if (wcsncmp(path, L"\\\\?\\", 4) == 0)
+        SetDllDirectoryW(path + 4);
+    else
+        SetDllDirectoryW(path);
+}
+
 int main(int argc, char** argv)
 {
+    ensure_engine_dll_search_path();
     SetConsoleOutputCP(CP_UTF8);
     SetBPXOptions(UE_BREAKPOINT_TYPE_INT3);
 

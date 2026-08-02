@@ -40,6 +40,11 @@ if(MSVC)
     target_compile_options(aidbg PRIVATE /utf-8)
     set_target_properties(aidbg PROPERTIES
         MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    # Delay-load TitanEngine.dll so main() can put the real module directory on
+    # the DLL search path first (needed when launched via a symlink, e.g. the
+    # winget portable Links\aidbg.exe -> Packages\aidbg.exe indirection).
+    target_link_libraries(aidbg PRIVATE Delayimp.lib)
+    target_link_options(aidbg PRIVATE "/DELAYLOAD:TitanEngine.dll")
 endif()
 
 set_property(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" PROPERTY VS_STARTUP_PROJECT aidbg)

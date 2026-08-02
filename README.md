@@ -192,18 +192,14 @@ tests\run_tests.cmd        :: 全绿返回 0，可接入 CI
 
 ## Roadmap
 
-A. ~~局部变量 + 表达式求值~~（**已实现**，handover7：`print`/`condition`/`set`
-   局部变量与表达式、`frame`/`up`/`down` 帧导航，用例 4.26–4.29）
-B. AI 接口增强
-- --host/--port 长驻 socket 协议（一次会话多命令，免每次启动进程）
-- JSON 结构化增强（dump/x 字节数组、断点字段补全）
-C. 引擎稳定与边界
-- WOW64 下 info locals/bt/thread 的 32 位展开验证
-- list 支持非 ASCII 源文件路径（std::ifstream 窄路径改宽字符）
-- set scheduler-locking on|off（GDB 多线程步进选项）
-D. 断点高级
-- commands <id> 断点命令列表（自动 continue 等）
-- until / advance <loc> 运行到指定位置
+- [x] **局部变量 + 表达式求值**（已实现，handover7）：`print`/`condition`/`set` 支持
+  局部变量与算术表达式；`frame`/`up`/`down` 帧导航（用例 4.26–4.29）
+- [ ] **AI 接口增强**：`--host/--port` 长驻 socket 协议（一次会话多命令，免每次
+  启动进程）；JSON 结构化增强（dump/x 字节数组、断点字段补全）
+- [ ] **引擎稳定与边界**：WOW64 下 `info locals`/`bt`/`thread` 的 32 位展开验证；
+  `list` 支持非 ASCII 源文件路径（宽字符打开）；`set scheduler-locking on|off`
+- [ ] **断点高级**：`commands <id>` 断点命令列表（自动 continue 等）；
+  `until` / `advance <loc>` 运行到指定位置
 
 ## 文档
 

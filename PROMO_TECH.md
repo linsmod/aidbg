@@ -80,7 +80,7 @@ aidbg.exe --json --command "bt" target.exe
 - **附加**：`attach <pid>` / `detach`（分离后目标存活）；
 - **内存**：`x/<n><fmt>`（b/w/g + x/d/u/i/s/c/f）、`search`（`?` 通配）、`strings`。
 
-## 已知边界（源码级记录，见 ISSUES.md）
+## 已知边界（源码级记录，见 README.md）
 
 - `print <裸标识符>`、`condition` 局部变量、`step`/`next` 源码级单步未实现
   （`stepi`/`nexti` 指令级可用）；

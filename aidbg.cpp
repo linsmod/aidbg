@@ -197,7 +197,8 @@ static std::condition_variable g_cv;
 static bool g_stopped = false;              // paused at a stop event
 static bool g_waiting = false;              // a stop callback is blocked awaiting resume
 static bool g_exited  = false;              // target process exited
-static bool g_quit    = false;              // user quit
+static bool g_quit    = false;              // session teardown (stop_session / resume unblock)
+static bool g_quit_cmd = false;             // user typed quit/q/exit: stop processing commands
 static std::string g_reason;                // reason of current stop
 static bool g_running = false;              // debug loop is active
 static std::thread g_loop_thread;
@@ -464,6 +465,9 @@ static void __cdecl cb_access_violation(void*)
     if (de && de->dwDebugEventCode == EXCEPTION_DEBUG_EVENT) {
         g_exception_code = de->u.Exception.ExceptionRecord.ExceptionCode;
         g_exception_addr = (ULONG_PTR)de->u.Exception.ExceptionRecord.ExceptionAddress;
+        // First-chance access violations are passed to the debuggee (its SEH may
+        // handle them); only an unhandled (second-chance) AV stops the debugger.
+        if (de->u.Exception.dwFirstChance) return;
     }
     pause_until_continue("exception");
 }
@@ -492,7 +496,12 @@ static void __cdecl cb_exception_stop(void*)
         // Breakpoint disposition is debugger policy, not an engine heuristic.
         // Preserve TitanEngine's NOT_HANDLED default for RaiseException and
         // other exceptions, but make `continue` consume an executed short int3.
-        if (g_exception_code == STATUS_BREAKPOINT) {
+        // A target-generated int3 surfaces as STATUS_BREAKPOINT on native x64 and
+        // as STATUS_WX86_BREAKPOINT for a 32-bit target under WoW64; both have the
+        // 0xCC opcode at the exception address (e.g. DebugBreak()).
+        bool is_bp_cat = (g_exception_code == STATUS_BREAKPOINT ||
+                          g_exception_code == STATUS_WX86_BREAKPOINT);
+        if (is_bp_cat) {
             g_hit_bp_id = 0;
             PROCESS_INFORMATION* pi = TitanGetProcessInformation();
             unsigned char opcode = 0;
@@ -501,6 +510,14 @@ static void __cdecl cb_exception_stop(void*)
                                            &opcode, sizeof(opcode), nullptr) &&
                       opcode == 0xCC;
         }
+
+        // First-chance exceptions that are not breakpoints are passed through to
+        // the debuggee (GDB/WinDbg default): the debuggee's own SEH may handle
+        // them (e.g. benign WoW64/RPC startup noise such as 0x6ba or 0xc0020043),
+        // so pausing is pure noise. Only an exception the debuggee leaves
+        // unhandled (second chance) stops the debugger.
+        if (de->u.Exception.dwFirstChance && !is_bp_cat)
+            return;
     }
     pause_until_continue(is_int3 ? "breakpoint" : "exception", is_int3);
 }
@@ -889,9 +906,8 @@ static std::string stop_json(const std::string& reason)
     std::string thread = de ? std::to_string(de->dwThreadId) : "0";
     ULONG_PTR rip = reg_get(UE_CIP);
     std::ostringstream o;
-    o << "{\"type\":\"stopped\",\"reason\":\"" << js_str(reason) << "\",\"thread\":" << thread
-      << ",\"rip\":\"" << hex(rip) << "\",\"rip_symbol\":\"" << js_str(resolve(rip))
-      << "\",\"registers\":" << regs_json();
+    o << "{\"ok\":true,\"type\":\"stopped\",\"reason\":\"" << js_str(reason) << "\",\"thread\":" << thread
+      << ",\"rip\":\"" << hex(rip) << "\",\"rip_symbol\":\"" << js_str(resolve(rip)) << "\"";
     {
         std::string f; long l = 0;
         if (src_line(rip, f, l)) {
@@ -929,7 +945,6 @@ static std::string stop_banner(const std::string& reason)
     if (reason == "exception")
         o << "  exception 0x" << std::hex << g_exception_code << " at " << hex(g_exception_addr) << std::dec << "\n";
     o << "  rip = " << hex(reg_get(UE_CIP)) << "  (" << resolve(reg_get(UE_CIP)) << ")\n";
-    o << "  registers:\n" << regs_text();
     return o.str();
 }
 
@@ -2025,12 +2040,8 @@ static CmdResult cmd_info_vars(bool args_only)
 static CmdResult cmd_run(const std::vector<std::string>& args, const std::string& raw_args, bool gdb_start = false)
 {
     if (g_target.empty()) return {false, "no target file; use: file <path>"};
-    if (g_running) { ForceClose(); if (g_loop_thread.joinable()) g_loop_thread.join(); }
+    if (g_running) stop_session();   // wake a paused DebugLoop callback, then join
     reset_state();
-
-    // engine options
-    SetEngineVariable(UE_ENGINE_PASS_ALL_EXCEPTIONS, false);
-    SetEngineVariable(UE_ENGINE_DISABLE_ASLR, false);
 
     register_handlers();
 
@@ -2074,7 +2085,7 @@ static CmdResult cmd_run(const std::vector<std::string>& args, const std::string
             reason = wait_stop_consume();
         }
         if (reason == "exited" || reason == "ended") {
-            if (g_json) printf("{\"type\":\"exited\",\"code\":%ld}\n", GetExitCode());
+            if (g_json) printf("{\"ok\":true,\"type\":\"exited\",\"code\":%ld}\n", GetExitCode());
             else if (!g_silent) printf("Process exited with code %ld\n", GetExitCode());
             fflush(stdout);
             return {};
@@ -2122,7 +2133,7 @@ static CmdResult cmd_run(const std::vector<std::string>& args, const std::string
         }
         reason = wait_stop_consume();
         if (reason == "exited" || reason == "ended") {
-            if (g_json) printf("{\"type\":\"exited\",\"code\":%ld}\n", GetExitCode());
+            if (g_json) printf("{\"ok\":true,\"type\":\"exited\",\"code\":%ld}\n", GetExitCode());
             else if (!g_silent) printf("Process exited with code %ld\n", GetExitCode());
             fflush(stdout);
             return {};
@@ -2166,7 +2177,7 @@ static CmdResult cmd_detach()
     }
     std::string reason = wait_stop_consume();
     if (reason != "exited") {
-        if (g_json) printf("{\"type\":\"detached\",\"pid\":%lu}\n", pid);
+        if (g_json) printf("{\"ok\":true,\"type\":\"detached\",\"pid\":%lu}\n", pid);
         else if (!g_silent) printf("Detached from process %lu\n", pid);
     }
     if (g_loop_thread.joinable()) g_loop_thread.join();
@@ -2179,19 +2190,19 @@ static CmdResult cmd_continue()
 {
     if (!require_running()) return {false, "no active debug session"};
     if (!g_waiting) return {false, "target is not stopped"};
-    if (g_json) printf("{\"type\":\"running\"}\n"); else if (!g_silent) printf("Continuing.\n");
+    if (g_json) printf("{\"ok\":true,\"type\":\"running\"}\n"); else if (!g_silent) printf("Continuing.\n");
     fflush(stdout);
     ctx_reset();
     resume_waiting_callback();
     std::string reason = wait_stop_consume();
     if (reason == "exited") {
-        if (g_json) printf("{\"type\":\"exited\",\"code\":%ld}\n", GetExitCode());
+        if (g_json) printf("{\"ok\":true,\"type\":\"exited\",\"code\":%ld}\n", GetExitCode());
         else if (!g_silent) printf("Process exited with code %ld\n", GetExitCode());
         fflush(stdout);
         return {};
     }
     if (reason == "ended") {
-        if (g_json) printf("{\"type\":\"exited\",\"code\":%ld}\n", GetExitCode());
+        if (g_json) printf("{\"ok\":true,\"type\":\"exited\",\"code\":%ld}\n", GetExitCode());
         else if (!g_silent) printf("Debug session ended\n");
         fflush(stdout);
         return {};
@@ -2247,13 +2258,13 @@ static CmdResult cmd_step(const char* kind, int n)
         }
     }
     if (reason == "exited") {
-        if (g_json) printf("{\"type\":\"exited\",\"code\":%ld}\n", GetExitCode());
+        if (g_json) printf("{\"ok\":true,\"type\":\"exited\",\"code\":%ld}\n", GetExitCode());
         else if (!g_silent) printf("Process exited with code %ld\n", GetExitCode());
         fflush(stdout);
         return {};
     }
     if (reason == "ended") {
-        if (g_json) printf("{\"type\":\"exited\",\"code\":%ld}\n", GetExitCode());
+        if (g_json) printf("{\"ok\":true,\"type\":\"exited\",\"code\":%ld}\n", GetExitCode());
         else if (!g_silent) printf("Debug session ended\n");
         fflush(stdout);
         return {};
@@ -2397,13 +2408,13 @@ static CmdResult cmd_source_step(const char* kind, int n)
     }
     clear_internal_bp();
     if (reason == "exited") {
-        if (g_json) printf("{\"type\":\"exited\",\"code\":%ld}\n", GetExitCode());
+        if (g_json) printf("{\"ok\":true,\"type\":\"exited\",\"code\":%ld}\n", GetExitCode());
         else if (!g_silent) printf("Process exited with code %ld\n", GetExitCode());
         fflush(stdout);
         return {};
     }
     if (reason == "ended") {
-        if (g_json) printf("{\"type\":\"exited\",\"code\":%ld}\n", GetExitCode());
+        if (g_json) printf("{\"ok\":true,\"type\":\"exited\",\"code\":%ld}\n", GetExitCode());
         else if (!g_silent) printf("Debug session ended\n");
         fflush(stdout);
         return {};
@@ -3124,8 +3135,9 @@ static CmdResult cmd_bt(const std::vector<std::string>& args)
     for (size_t i = 0; i < addrs.size(); i++) {
         ULONG_PTR a = addrs[i];
         if (i) j << ",";
-        j << "{\"frame\":" << i << ",\"rip\":\"" << hex(a) << "\"}";
         std::string r = resolve(a);
+        j << "{\"frame\":" << i << ",\"rip\":\"" << hex(a) << "\",\"symbol\":\""
+          << js_str(r) << "\"}";
         o << "#" << i << "  " << hex(a) << " in " << (r.empty() ? "??" : r) << "\n";
     }
     j << "]";
@@ -3599,16 +3611,20 @@ static CmdResult cmd_print(const std::string& raw_args)
 // -- set engine var --
 static CmdResult cmd_set_engine(const std::vector<std::string>& args)
 {
-    if (args.size() < 2) return {false, "usage: set engine <aslr|console|passexc> on|off"};
+    if (args.size() < 2) return {false, "usage: set engine <aslr|disable-randomization|console|passexc> on|off"};
     std::string var = args[0];
     bool on = args[1] == "on" || args[1] == "1" || args[1] == "true";
-    DWORD id = 0;
     std::transform(var.begin(), var.end(), var.begin(), ::tolower);
-    if (var == "aslr") id = UE_ENGINE_DISABLE_ASLR;
-    else if (var == "console") id = UE_ENGINE_NO_CONSOLE_WINDOW;
-    else if (var == "passexc") id = UE_ENGINE_PASS_ALL_EXCEPTIONS;
+    if (var == "aslr" || var == "disable-randomization") {
+        // GDB semantics: `set disable-randomization on` disables ASLR (stable
+        // addresses). `aslr` follows its natural meaning: on = keep ASLR (default),
+        // off = disable ASLR. Both map to the same engine variable, inverted.
+        bool disable = (var == "disable-randomization") ? on : !on;
+        SetEngineVariable(UE_ENGINE_DISABLE_ASLR, disable);
+    }
+    else if (var == "console") SetEngineVariable(UE_ENGINE_NO_CONSOLE_WINDOW, on);
+    else if (var == "passexc") SetEngineVariable(UE_ENGINE_PASS_ALL_EXCEPTIONS, on);
     else return {false, "unknown engine variable"};
-    SetEngineVariable(id, on);
     CmdResult cr;
     cr.js = "{\"variable\":\"" + js_str(var) + "\",\"value\":" + (on ? "true" : "false") + "}";
     cr.text = std::string("engine.") + var + " = " + (on ? "on" : "off");
@@ -3718,7 +3734,7 @@ static const char* HELP =
 "  search <addr> <size> <pat>  find byte pattern (? = wildcard)\n"
 "  strings <addr> [size]       scan for ascii strings\n"
 "  echo <text>                 print text\n"
-"  set engine <var> on|off     aslr / console / passexc\n"
+"  set engine <var> on|off     aslr / disable-randomization / console / passexc\n"
 "  set source-checksum on|off  verify source files against PDB checksums (default off)\n"
 "  show source-checksum        show the source-checksum toggle\n"
 "  help / quit / q\n";
@@ -3749,17 +3765,13 @@ static CmdResult execute(const std::string& line)
     if (sp != std::string::npos) raw_args = trimmed.substr(sp + 1);
 
     if (cmd == "quit" || cmd == "q" || cmd == "exit") {
-        g_quit = true;
-        {
-            std::lock_guard<std::mutex> lk(g_mu);
-            g_waiting = false;
-            g_cv.notify_all();
-        }
-        if (g_running) {
-            StopDebug();
-            if (g_loop_thread.joinable()) g_loop_thread.join();
-        }
-        exit(0);
+        // GDB: quit ends command processing; the caller breaks out of its loop
+        // and then tears down the session, so the batch exit code computed by
+        // main() is preserved (crash / command error -> nonzero).
+        g_quit_cmd = true;
+        CmdResult cr;
+        cr.ok = true;
+        return cr;
     }
     if (cmd == "help" || cmd == "?") return cmd_help();
     if (cmd == "echo") {
@@ -4021,6 +4033,7 @@ int main(int argc, char** argv)
         g_batch = true;   // bare "run" continues past the initial break, like GDB
         int rc = 0;
         for (auto& item : batch) {
+            if (g_quit_cmd) break;
             if (item.is_file) {
                 std::ifstream f(item.text);
                 if (!f) { fprintf(stderr, "cannot open %s\n", item.text.c_str()); rc = 1; continue; }
@@ -4029,6 +4042,7 @@ int main(int argc, char** argv)
                     CmdResult r = execute(line);
                     print_result(r);
                     if (!r.ok && !soft_error(r.err)) rc = 1;
+                    if (g_quit_cmd) break;
                 }
             } else {
                 CmdResult r = execute(item.text);
@@ -4060,6 +4074,7 @@ int main(int argc, char** argv)
             CmdResult r = execute(line);
             print_result(r);
             if (!r.ok && r.err == "unknown command") continue; // tolerate
+            if (g_quit_cmd) break;
         }
         stop_session();
         return 0;
@@ -4071,8 +4086,9 @@ int main(int argc, char** argv)
         while (std::getline(std::cin, line)) {
             CmdResult r = execute(line);
             print_result(r);
+            if (g_quit_cmd) break;
         }
-        if (g_running) { stop_session(); }
+        stop_session();
         return 0;
     }
 
@@ -4085,7 +4101,8 @@ int main(int argc, char** argv)
         if (!std::getline(std::cin, line)) break;
         CmdResult r = execute(line);
         print_result(r);
+        if (g_quit_cmd) break;
     }
-    if (g_running) { stop_session(); }
+    stop_session();
     return 0;
 }

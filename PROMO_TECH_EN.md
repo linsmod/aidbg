@@ -90,7 +90,7 @@ stdin pipe for multi-command sessions.
 - **Attach**: `attach <pid>` / `detach` (target keeps running after detach);
 - **Memory**: `x/<n><fmt>` (b/w/g + x/d/u/i/s/c/f), `search` (`?` wildcards), `strings`.
 
-## Known Boundaries (source-level, see ISSUES.md)
+## Known Boundaries (source-level, see README.md)
 
 - `print <bare identifier>`, `condition` with local variables, and source-level
   `step`/`next` are not implemented (`stepi`/`nexti` at instruction level work);

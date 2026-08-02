@@ -9,10 +9,10 @@ Design notes (these are the realities the suite is built around):
   * Symbol breakpoints (`break main`) require the PDB to be loaded, which only
     happens once the target has started -> cases use `start` (which stops at
     the internal initial breakpoint) and only then `break <symbol>`.
-  * In batch mode a bare `run` continues past the initial breakpoint and runs
-    to completion, so the exception cases (4.4/4.4b) use `run` to reach the
-    fault and are asserted on the *output text*, not the exit code (the exit
-    code after `quit` is subject to a stop/quit race in aidbg).
+  * GDB batch exit codes are now reliable: `quit` ends command processing
+    without discarding the exit code, so 0 = success and nonzero = a command
+    error or a crash/exception stop. The exception cases (4.4/4.4b) and the
+    out-of-range line case (4.11c) assert exit 1; everything else asserts 0.
   * Dynamic values (thread ids, PIDs, search hit addresses) cannot live in a
     static script, so those cases are driven here programmatically.
 
@@ -511,12 +511,14 @@ CASES = [
         "name": "exception div-zero (0xc0000094)",
         "script": "case_4_4_exception_divzero.txt",
         "expect": ["Stopped: exception", "0xc0000094", "imagebase"],
+        "exit": 1,
     },
     {
         "id": "4.4b",
         "name": "exception access violation (0xc0000005)",
         "script": "case_4_4b_exception_av.txt",
         "expect": ["Stopped: exception", "0xc0000005"],
+        "exit": 1,
     },
     {
         "id": "4.5",
@@ -566,6 +568,7 @@ CASES = [
         "name": "out-of-range source line errors",
         "script": "case_4_11c_line_oob.txt",
         "expect": ["No line 999"],
+        "exit": 1,
     },
     {
         "id": "4.12",
@@ -699,7 +702,10 @@ def run_case(case):
     """
     script = os.path.join(CASES_DIR, case["script"])
     rc, out = aidbg_run(script)
-    results = [("script exits", rc == 0, out)]
+    # GDB batch exit code: 0 on success, nonzero on a command error or a
+    # crash/exception stop (quit preserves this now, matching GDB).
+    want = case.get("exit", 0)
+    results = [("script exits %d" % want, rc == want, out)]
     if case["expect"]:
         missing = expect(out, case["expect"])
         results.append(("output contains %s" % ", ".join(case["expect"]),

@@ -1,8 +1,8 @@
 # handover6.md — 符号解析缺口修复与命令边界完善
 
-> 状态：**方案待实现**。补测 bp-hit 上下文命令（用例 4.23/4.24）时发现两个 GDB
-> 可用的命令因 `parse_addr` 不解析 PDB 符号而失败，已用 4.25 xfail 记录。本文档
-> 记录修复方案与"已知边界"的完善清单。代码变更见 `aidbg.cpp`，测试见 `tests/`。
+> 状态：**已实现**。`parse_addr` 增加 PDB 符号回退（P0），`cmd_print` 支持裸标识符
+> 取值（P1）；用例 4.25 由 xfail 转常态并全绿。代码变更见 `aidbg.cpp`，
+> 测试：`tests/run_tests.py` 31 项全绿。
 
 ## 0. 背景与目标
 
@@ -99,3 +99,25 @@ return false;
 3. 用例 4.25 去 xfail 改常态断言；必要时补 `x <符号>` / `set *<符号>` 断言。
 4. README「已知边界」与「GDB 兼容命令清单」按 §4 更新。
 5. 全量回归。
+
+## 7. 实现结果（对照方案）
+
+全部落地，两处与 §2/§3 原始方案不同：
+
+| 项 | 方案 | 实际实现 |
+| :--- | :--- | :--- |
+| `parse_addr` 兜底位置 | 末尾追加 `sym_lookup` | 需把 `try/stoull` 的 `catch` 改为**不提前返回**（原 `return false` 使后续 `sym_lookup` 不可达）；`stoull` 成功才返回，失败落空继续走符号回退 |
+| `cmd_break` 分支顺序 | 未涉及 | 符号断点分支**前移到 `parse_addr` 之前**：parse_addr 现在也能解析符号，若不前移，`break func2` 会走地址分支、丢失 `at func2 (0x...)` 显示 |
+| `print <符号>` 函数 vs 数据 | 方案未提区分 | 用 `VirtualQueryEx` 判断地址是否在**可执行区**：函数打印地址（GDB `print func`）、数据读 8 字节打印值。`SYMFLAG_FUNCTION` 在实测中不可靠，弃用 |
+
+实测：
+- `disas func2, func2+0x10` → 反汇编（`MOV`）；`print global_var` → `value = 0x2a (42)`；
+  `print func2` → `value = 0x1400075e0`（函数地址）；`x global_var` → .data 内容；
+  `set *global_var = 5` → 写回后再 `print` → `value = 5`。
+- 全部 31 项测试通过；4.25 由 xfail 转常态。
+
+### 7.1 边界更新（已写入 README）
+
+- 删除「`disas <符号>` / `print <全局符号>` 不支持」条目 → 改为支持。
+- `print <局部标识符>`、`condition` 局部变量、观察点页级粒度、同地址重复内存断点、
+  多线程冻结、`step` 单行循环慢等保持原限制（§4 表格）。

@@ -654,10 +654,10 @@ CASES = [
     },
     {
         "id": "4.25",
-        "name": "disas <symbol> / print <global> (KNOWN GAP)",
-        "script": "case_4_25_sym_addr_xfail.txt",
-        "expect": ["MOV", "value = 42"],
-        "xfail": "parse_addr does not resolve PDB symbols for disas/print",
+        "name": "symbol resolution: disas/x/set/print",
+        "script": "case_4_25_sym_addr.txt",
+        "expect": ["MOV", "value = 0x000000000000002a", "value = 0x00000001400075e0",
+                   "Wrote 0x0000000000000005", "value = 0x0000000000000005"],
     },
 ]
 

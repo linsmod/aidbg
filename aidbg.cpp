@@ -1716,12 +1716,16 @@ static bool parse_addr(const std::string& tok, ULONG_PTR& out)
         }
         return false;
     }
-    try {
-        size_t pos = 0;
-        if (t.rfind("0x", 0) == 0) out = std::stoull(t, &pos, 16);
-        else out = std::stoull(t, &pos, 10);
-        return pos == t.size();
-    } catch (...) { return false; }
+    {
+        try {
+            size_t pos = 0;
+            if (t.rfind("0x", 0) == 0) out = std::stoull(t, &pos, 16);
+            else out = std::stoull(t, &pos, 10);
+            if (pos == t.size()) return true;
+        } catch (...) {}
+    }
+    // bare identifier: fall back to PDB symbol lookup (needs symbols loaded)
+    return sym_lookup(t, out);
 }
 
 // ------------------------------------------------------------------ commands ---
@@ -2352,26 +2356,10 @@ static CmdResult cmd_break(const std::vector<std::string>& args)
         }
     }
 
+    // PDB symbol name first (keeps the "at <symbol> (0x...)" display): break boom
+    // or break symtest!boom. Tried before parse_addr because parse_addr now also
+    // resolves symbols as a fallback.
     ULONG_PTR addr = 0;
-    bool ok = parse_addr(spec, addr);
-    if (ok && addr) {
-        // SetBPX needs the debugged process; before `run` the breakpoint is pending
-        bool running = require_running();
-        if (running) {
-            bool r = SetBPX(addr, UE_BREAKPOINT | UE_BREAKPOINT_TYPE_INT3, (void*)&cb_bpx);
-            if (!r) return {false, "SetBPX failed"};
-        }
-        Bpx b; b.id = g_bp_next_id++; b.kind = 0; b.addr = addr; b.enabled = true; b.symbol = spec;
-        b.pending = !running;
-        g_bps[b.id] = b;
-        CmdResult cr; cr.ok = true;
-        cr.js = "{\"breakpoint\":{\"id\":" + std::to_string(b.id) + ",\"kind\":\"code\",\"address\":\"" + hex(addr) + "\""
-              + (b.pending ? ",\"pending\":true" : "") + "}}";
-        cr.text = "Breakpoint " + std::to_string(b.id) + " at " + hex(addr)
-                + (b.pending ? " (pending: applied on run)" : "");
-        return cr;
-    }
-    // PDB symbol name: break boom  or  break symtest!boom
     if (sym_lookup(spec, addr) && addr) {
         bool running = require_running();
         if (running) {
@@ -2386,6 +2374,23 @@ static CmdResult cmd_break(const std::vector<std::string>& args)
               + hex(addr) + "\",\"symbol\":\"" + js_str(spec) + "\""
               + (b.pending ? ",\"pending\":true" : "") + "}}";
         cr.text = "Breakpoint " + std::to_string(b.id) + " at " + spec + " (" + hex(addr) + ")"
+                + (b.pending ? " (pending: applied on run)" : "");
+        return cr;
+    }
+    if (parse_addr(spec, addr) && addr) {
+        // SetBPX needs the debugged process; before `run` the breakpoint is pending
+        bool running = require_running();
+        if (running) {
+            bool r = SetBPX(addr, UE_BREAKPOINT | UE_BREAKPOINT_TYPE_INT3, (void*)&cb_bpx);
+            if (!r) return {false, "SetBPX failed"};
+        }
+        Bpx b; b.id = g_bp_next_id++; b.kind = 0; b.addr = addr; b.enabled = true; b.symbol = spec;
+        b.pending = !running;
+        g_bps[b.id] = b;
+        CmdResult cr; cr.ok = true;
+        cr.js = "{\"breakpoint\":{\"id\":" + std::to_string(b.id) + ",\"kind\":\"code\",\"address\":\"" + hex(addr) + "\""
+              + (b.pending ? ",\"pending\":true" : "") + "}}";
+        cr.text = "Breakpoint " + std::to_string(b.id) + " at " + hex(addr)
                 + (b.pending ? " (pending: applied on run)" : "");
         return cr;
     }
@@ -3383,6 +3388,35 @@ static CmdResult cmd_print(const std::string& raw_args)
         DWORD idx = reg_index_for_name(expr.substr(1), is64);
         if (!idx) return {false, "unknown register: " + expr.substr(1)};
         val = reg_get(idx);
+    } else if (!deref && !expr.empty() &&
+               (isalpha((unsigned char)expr[0]) || expr[0] == '_')) {
+        // bare identifier: a PDB data symbol prints its VALUE (GDB `print var`);
+        // a function symbol prints its address (GDB `print func`).
+        ULONG_PTR a = 0;
+        if (sym_lookup(expr, a)) {
+            // function symbols live in an executable region: print their address
+            // (GDB `print func`); data symbols: print the value stored at them.
+            bool is_func = false;
+            PROCESS_INFORMATION* pi = TitanGetProcessInformation();
+            if (pi && pi->hProcess) {
+                MEMORY_BASIC_INFORMATION mbi = {};
+                if (VirtualQueryEx(pi->hProcess, (LPCVOID)a, &mbi, sizeof(mbi))) {
+                    DWORD prot = mbi.Protect & 0xFF;
+                    is_func = prot == PAGE_EXECUTE || prot == PAGE_EXECUTE_READ ||
+                              prot == PAGE_EXECUTE_READWRITE || prot == PAGE_EXECUTE_WRITECOPY;
+                }
+            }
+            if (is_func) {
+                val = a;
+            } else {
+                SIZE_T n = sizeof(ULONG_PTR), nr = 0;
+                if (!mem_read(a, &val, n, &nr) || nr < n) return {false, "memory read failed"};
+            }
+        } else {
+            ULONG_PTR a2 = 0;
+            if (!parse_addr(expr, a2)) return {false, "cannot parse expression: " + expr};
+            val = a2;
+        }
     } else {
         ULONG_PTR a = 0;
         if (!parse_addr(expr, a)) return {false, "cannot parse expression: " + expr};

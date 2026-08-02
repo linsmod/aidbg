@@ -1,0 +1,16 @@
+# Case 4.25 - symbol resolution in disas / x / set / print (handover6.md P0/P1)
+# Target: test_basic.exe
+# After parse_addr gained a PDB symbol fallback, `disas <symbol>`, `x <symbol>`
+# and `set *<symbol>` resolve addresses, and `print <global>` prints the
+# variable value (GDB-like); `print <func>` prints the function address.
+file test_basic.exe
+start
+break func2
+continue
+disas func2, func2+0x10
+print global_var
+print func2
+x global_var
+set *global_var = 5
+print global_var
+quit

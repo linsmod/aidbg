@@ -152,15 +152,16 @@ echo / help / quit(q)
 
 ### 数据（Data）
 
-| `print` / `p` | 打印表达式 | 支持 `$reg` / 字面量 / `*addr`；**不支持裸标识符**（见已知边界） | ⚠️ | 4.6/4.25 |
-| `x/<n><fmt> <addr>` | 检视内存 | 同左（b/h/w/g + x/d/u/i/s/c/f） | ✅ | 4.12 |
+| `print` / `p` | 打印表达式 | 支持 `$reg` / 字面量 / `*addr` / 全局符号（数据打印值、函数打印地址）；**不支持局部标识符与表达式** | ⚠️ | 4.6/4.25 |
+| `x/<n><fmt> <addr>` | 检视内存 | 同左（b/h/w/g + x/d/u/i/s/c/f，支持符号） | ✅ | 4.12/4.25 |
+| `dump <addr>` | 原始 hex+ascii 转储 | 同左 | ✅ | 4.23 |
 | `set $reg = <val>` | 写寄存器 | 同左 | ✅ | 4.6 |
-| `set *addr = <val>` | 写内存 | 同左 | ✅ | 4.6 |
+| `set *addr = <val>` | 写内存 | 同左（支持符号地址） | ✅ | 4.6/4.25 |
 | `registers` / `regs` | `info registers` 快捷别名 | 同左 | ✅ | — |
 
 ### 反汇编与工具（Disassembly / Misc）
 
-| `disas` / `disassemble [start,end]` | 反汇编 | 同左（GDB 区间语法） | ✅ | 4.5 |
+| `disas` / `disassemble [start,end]` | 反汇编 | 同左（GDB 区间语法，支持符号） | ✅ | 4.5/4.25 |
 | `help` / `quit` / `echo` | 帮助 / 退出 / 输出 | 同左 | ✅ | — |
 | `dump` / `search` / `strings` / `info modules\|events\|proc` | — | aidbg 独有扩展 | ⓘ | 4.10 |
 
@@ -180,7 +181,7 @@ echo / help / quit(q)
 驻留进程）+ 自动化用例，覆盖断点、条件 / ignore、内存观察点、异常、单步、
 源码级 `step`/`next`、变量枚举、线程切换、attach/detach、搜索、行号断点、
 bp 命中后上下文命令、GDB 兼容性（含 4.21 命令走查、4.22 批处理退出码、
-4.25 已知缺口 xfail），全部通过（31 项）：
+4.25 符号解析），全部通过（31 项）：
 
 ```cmd
 set _NT_SYMBOL_PATH=%CD%\..
@@ -199,9 +200,10 @@ tests\run_tests.cmd        :: 全绿返回 0，可接入 CI
 
 ## 已知边界
 
-- `print <裸标识符>`、`condition` 局部变量未实现（`print` 支持 `$reg`/字面量/`*addr`）。
-- `disas <符号>` 与 `print <全局符号>` 暂不支持 PDB 符号解析（`parse_addr` 不解析
-  符号名），用例 4.25 以 xfail 记录；`break`/`list`/`hbreak`/`watch` 已支持符号。
+- `print <局部标识符>`、`condition` 局部变量未实现（`print` 支持 `$reg`/字面量/
+  `*addr`/**全局符号**：数据符号打印值、函数符号打印地址）。
+- `disas`/`x`/`set`/`print` 支持 PDB 符号（`parse_addr` 符号回退，handover6）；
+  `break`/`list`/`hbreak`/`watch`/`mbreak`/`condition` 亦支持。
 - 源码级 `step`/`next` 已实现（`archive/handover5.md`）；无 PDB 行号时回退指令级单步
   （`stepi`/`nexti`）并提示。
 - 32 位（WOW64）目标已支持（软件/硬件断点、单步；用例 4.16–4.18）。

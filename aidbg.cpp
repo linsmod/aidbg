@@ -249,6 +249,13 @@ static DWORD g_ctx_tid = 0;
 static CONTEXT g_ctx;                    // cached GetThreadContext snapshot
 static bool g_ctx_valid = false;
 
+// frame navigation (GDB `frame`/`up`/`down`): per-frame context cache from the
+// StackWalk64 walk, used by ctx_display to resolve a selected frame's registers
+// and local variables. Reset on every resume (ctx_reset).
+struct FrameInfo { CONTEXT ctx; ULONG_PTR pc; ULONG_PTR frameBase; };
+static std::vector<FrameInfo> g_frames;
+static int g_frame_idx = 0;              // 0 = top (current) frame
+
 // modules cache (address -> module)
 struct ModInfo { ULONG_PTR base; std::string name; std::string path; };
 static std::vector<ModInfo> g_mods;
@@ -276,6 +283,11 @@ static bool sym_lookup(const std::string& name, ULONG_PTR& out);
 static bool eval_cond(const std::string& expr, bool& out);
 static void apply_pending_bps();
 static bool src_line(ULONG_PTR addr, std::string& file, long& line);
+struct ScopeVar;
+static bool local_lookup(const std::string& name, const CONTEXT& c, bool is64,
+                         unsigned long long& val, ULONG_PTR& addr, DWORD& size);
+static bool frame_base_rsp(CONTEXT& c, bool is64, ULONG_PTR& out);
+static bool eval_expr(const std::string& expr, unsigned long long& out);
 static std::string resolve_gdb(ULONG_PTR addr);
 static bool resolve_line(const std::string& file, long line, ULONG_PTR& out);
 static bool require_running();
@@ -769,8 +781,23 @@ static CONTEXT ctx_from_titan()
     return c;
 }
 
-// CONTEXT of the thread whose registers we currently display (default: event thread)
+// CONTEXT of the thread whose registers we currently display. A selected frame
+// (g_frame_idx > 0) overrides the thread's live context (GDB `frame N` view).
 static bool ctx_display(CONTEXT& out)
+{
+    if (g_frame_idx > 0 && g_frame_idx < (int)g_frames.size()) {
+        out = g_frames[g_frame_idx].ctx;
+        return true;
+    }
+    DWORD evtid = ctx_event_tid();
+    if (g_ctx_tid == 0 || g_ctx_tid == evtid) { out = ctx_from_titan(); return true; }
+    if (g_ctx_valid) { out = g_ctx; return true; }
+    return false;
+}
+
+// CONTEXT of the top (current) frame of the display thread -- the base context
+// for a stack walk / bt (does NOT apply the selected-frame override)
+static bool ctx_display_base(CONTEXT& out)
 {
     DWORD evtid = ctx_event_tid();
     if (g_ctx_tid == 0 || g_ctx_tid == evtid) { out = ctx_from_titan(); return true; }
@@ -804,6 +831,8 @@ static void ctx_reset()
 {
     g_ctx_tid = 0;
     g_ctx_valid = false;
+    g_frames.clear();   // stack is stale after a resume
+    g_frame_idx = 0;
 }
 
 static std::string regs_json()
@@ -1085,6 +1114,10 @@ static BOOL CALLBACK sym_lookup_all_cb(PSYMBOL_INFOW s, ULONG, PVOID c)
 {
     auto* ctx = (SymLookupCtx*)c;
     if (!s) return TRUE;
+    // locals/params are scope-relative offsets (not absolute addresses): a prior
+    // SymSetContext can make them appear in the enumeration -- skip them so
+    // global/static resolution is never poisoned by frame-local offsets.
+    if (s->Flags & (SYMFLAG_LOCAL | SYMFLAG_PARAMETER)) return TRUE;
     if (_wcsicmp(s->Name, ctx->want.c_str()) == 0) { ctx->hit = (ULONG_PTR)s->Address; return FALSE; }
     return TRUE;
 }
@@ -1100,7 +1133,9 @@ static bool sym_lookup(const std::string& name, ULONG_PTR& out)
     PSYMBOL_INFOW si = (PSYMBOL_INFOW)buf;
     si->SizeOfStruct = sizeof(SYMBOL_INFOW);
     si->MaxNameLen = MAX_SYM_NAME;
-    if (SymFromNameW(g_sym_proc, wname.c_str(), si)) { out = (ULONG_PTR)si->Address; return true; }
+    if (SymFromNameW(g_sym_proc, wname.c_str(), si)) {
+        if (!(si->Flags & (SYMFLAG_LOCAL | SYMFLAG_PARAMETER))) { out = (ULONG_PTR)si->Address; return true; }
+    }
     // globals/statics are often absent from the SymFromName index: enumerate every
     // symbol and pick the first exact name match
     SymLookupCtx ctx{ wname, 0 };
@@ -1322,7 +1357,19 @@ static std::string source_checksum_verify(HANDLE hProc, ULONG64 base, const std:
 //   variables resolved via symbols, read from memory), + - * / % & | ^ ~ ! and
 //   comparison / logical operators with parentheses.
 
-static bool eval_cond(const std::string& expr, bool& out)
+// true when `addr` lies in an executable region (a function, not data)
+static bool addr_is_code(ULONG_PTR a)
+{
+    PROCESS_INFORMATION* pi = TitanGetProcessInformation();
+    if (!pi || !pi->hProcess) return false;
+    MEMORY_BASIC_INFORMATION mbi = {};
+    if (!VirtualQueryEx(pi->hProcess, (LPCVOID)a, &mbi, sizeof(mbi))) return false;
+    DWORD prot = mbi.Protect & 0xFF;
+    return prot == PAGE_EXECUTE || prot == PAGE_EXECUTE_READ ||
+           prot == PAGE_EXECUTE_READWRITE || prot == PAGE_EXECUTE_WRITECOPY;
+}
+
+static bool eval_expr(const std::string& expr, unsigned long long& out)
 {
     struct P {
         const std::string& s;
@@ -1438,8 +1485,16 @@ static bool eval_cond(const std::string& expr, bool& out)
                 std::string name = s.substr(p, e-p); p = e;
                 if (name == "true") { v = 1; return true; }
                 if (name == "false") { v = 0; return true; }
+                // local variable of the current frame first
+                CONTEXT c;
+                unsigned long long lv = 0; ULONG_PTR la = 0; DWORD lsz = 0;
+                if (ctx_display(c) && local_lookup(name, c, target_is64(), lv, la, lsz)) {
+                    v = lv; return true;
+                }
+                // global symbol: function -> its address, data -> its value
                 ULONG_PTR addr = 0;
                 if (!sym_lookup(name, addr)) return fail();
+                if (addr_is_code(addr)) { v = addr; return true; }
                 SIZE_T n = sizeof(ULONG_PTR), nr = 0;
                 if (!mem_read(addr, &v, n, &nr) || nr < n) return fail();
                 return true;
@@ -1448,8 +1503,13 @@ static bool eval_cond(const std::string& expr, bool& out)
         }
     };
     P pa(expr);
+    return pa.parse_or(out) && pa.eof();
+}
+
+static bool eval_cond(const std::string& expr, bool& out)
+{
     unsigned long long v = 0;
-    if (!pa.parse_or(v) || !pa.eof()) return false;
+    if (!eval_expr(expr, v)) return false;
     out = (v != 0);
     return true;
 }
@@ -1540,6 +1600,65 @@ static bool var_read(const ScopeVar& v, ULONG_PTR frameBase, bool is64, unsigned
     if (mem_read(cand, &out, n, &nr) && nr >= n) { outaddr = cand; return true; }
     if (a && a != cand && a >= 0x10000) {
         if (mem_read(a, &out, n, &nr) && nr >= n) { outaddr = a; return true; }
+    }
+    return false;
+}
+
+// enumerate the locals/params visible at a frame's pc and compute the frame base.
+// Shared by cmd_info_vars and local_lookup.
+static bool scope_vars_for(const CONTEXT& c, bool is64, ULONG_PTR& frameBase,
+                           std::vector<ScopeVar>& out, bool& atEntry)
+{
+    if (!g_sym_active || !g_sym_proc) return false;
+    CONTEXT cc = c;   // frame_base_rsp mutates the context via RtlVirtualUnwind
+    if (!frame_base_rsp(cc, is64, frameBase))
+        frameBase = is64 ? (ULONG_PTR)c.Rsp : (ULONG_PTR)reg_get(UE_ESP);
+    IMAGEHLP_STACK_FRAME sf = {};
+    sf.InstructionOffset = is64 ? c.Rip : (ULONG64)reg_get(UE_EIP);
+    sf.FrameOffset = frameBase;
+    sf.StackOffset = is64 ? c.Rsp : (ULONG64)reg_get(UE_ESP);
+    if (!SymSetContext(g_sym_proc, &sf, nullptr)) {
+        if (!SymSetScopeFromAddr(g_sym_proc, sf.InstructionOffset)) return false;
+    }
+    out.clear();
+    if (!SymEnumSymbolsW(g_sym_proc, 0, nullptr, enum_scope_cb, &out)) return false;
+    atEntry = false;
+    if (is64) {
+        char b[sizeof(SYMBOL_INFOW) + MAX_SYM_NAME * sizeof(WCHAR)];
+        PSYMBOL_INFOW si = (PSYMBOL_INFOW)b;
+        si->SizeOfStruct = sizeof(SYMBOL_INFOW); si->MaxNameLen = MAX_SYM_NAME;
+        DWORD64 disp = 0;
+        if (SymFromAddrW(g_sym_proc, (DWORD64)c.Rip, &disp, si)) atEntry = (disp == 0);
+    }
+    return true;
+}
+
+// resolve a local/param variable name to its value and address in a frame
+static bool local_lookup(const std::string& name, const CONTEXT& c, bool is64,
+                         unsigned long long& val, ULONG_PTR& addr, DWORD& size)
+{
+    ULONG_PTR frameBase = 0;
+    std::vector<ScopeVar> vars;
+    bool atEntry = false;
+    if (!scope_vars_for(c, is64, frameBase, vars, atEntry)) return false;
+    std::vector<ScopeVar*> params, locals;
+    for (auto& v : vars) (v.isParam ? params : locals).push_back(&v);
+    std::sort(params.begin(), params.end(), [](ScopeVar* x, ScopeVar* y){ return x->addr < y->addr; });
+    std::sort(locals.begin(), locals.end(), [](ScopeVar* x, ScopeVar* y){ return x->addr < y->addr; });
+    static const DWORD ARG_REGS[4] = { UE_RCX, UE_RDX, UE_R8, UE_R9 };
+    for (size_t i = 0; i < params.size(); i++) {
+        ScopeVar* v = params[i];
+        if (v->name != name) continue;
+        unsigned long long vv = 0; ULONG_PTR at = 0;
+        if (atEntry && i < 4) vv = GetContextData(ARG_REGS[i]);
+        else if (!var_read(*v, frameBase, is64, vv, at)) continue;
+        val = vv; addr = at ? at : v->addr; size = v->size; return true;
+    }
+    for (auto* v : locals) {
+        if (v->name != name) continue;
+        unsigned long long vv = 0; ULONG_PTR at = 0;
+        if (!var_read(*v, frameBase, is64, vv, at)) continue;
+        val = vv; addr = at ? at : v->addr; size = v->size; return true;
     }
     return false;
 }
@@ -2714,48 +2833,63 @@ static CmdResult cmd_set(const std::vector<std::string>& args)
     }
     if (eq == std::string::npos || eq + 1 >= args.size()) return {false, "usage: set <reg> = <val>"};
     right = args[eq + 1];
+    for (size_t i = eq + 2; i < args.size(); i++) right += " " + args[i];   // full RHS expression
     bool is64 = target_is64();
     if (left.size() > 1 && left[0] == '*') {
         ULONG_PTR addr = 0;
         if (!parse_addr(left.substr(1), addr)) return {false, "bad address"};
-        ULONG_PTR val = 0;
-        if (!parse_addr(right, val)) return {false, "bad value"};
+        unsigned long long val = 0;
+        if (!eval_expr(right, val)) return {false, "bad value"};
         // infer size from value
         SIZE_T n = 8;
         if (val <= 0xFF) n = 1; else if (val <= 0xFFFF) n = 2; else if (val <= 0xFFFFFFFF) n = 4;
         SIZE_T nw = 0;
         if (!mem_write(addr, &val, n, &nw)) return {false, "MemoryWriteSafe failed"};
         CmdResult cr;
-        cr.js = "{\"address\":\"" + hex(addr) + "\",\"value\":\"" + hex(val) + "\",\"size\":" + std::to_string(n) + "}";
-        cr.text = "Wrote " + hex(val) + " (" + std::to_string(n) + " bytes) to " + hex(addr);
+        cr.js = "{\"address\":\"" + hex(addr) + "\",\"value\":\"" + hex((ULONG_PTR)val) + "\",\"size\":" + std::to_string(n) + "}";
+        cr.text = "Wrote " + hex((ULONG_PTR)val) + " (" + std::to_string(n) + " bytes) to " + hex(addr);
         return cr;
     }
     std::string regname = left;
     if (regname.size() > 1 && regname[0] == '$') regname = regname.substr(1);
     DWORD idx = reg_index_for_name(regname, is64);
     if (!idx) {
-        // not a register: try a bare memory address (module!off, 0x..., etc.)
+        // not a register: bare memory address (module!off, 0x..., symbol) or a
+        // local variable of the current frame
         ULONG_PTR a = 0;
         if (parse_addr(left, a)) {
-            ULONG_PTR val = 0;
-            if (!parse_addr(right, val)) return {false, "bad value"};
+            unsigned long long val = 0;
+            if (!eval_expr(right, val)) return {false, "bad value"};
             SIZE_T n = 8;
             if (val <= 0xFF) n = 1; else if (val <= 0xFFFF) n = 2; else if (val <= 0xFFFFFFFF) n = 4;
             SIZE_T nw = 0;
             if (!mem_write(a, &val, n, &nw)) return {false, "MemoryWriteSafe failed"};
             CmdResult cr;
-            cr.js = "{\"address\":\"" + hex(a) + "\",\"value\":\"" + hex(val) + "\",\"size\":" + std::to_string(n) + "}";
-            cr.text = "Wrote " + hex(val) + " (" + std::to_string(n) + " bytes) to " + hex(a);
+            cr.js = "{\"address\":\"" + hex(a) + "\",\"value\":\"" + hex((ULONG_PTR)val) + "\",\"size\":" + std::to_string(n) + "}";
+            cr.text = "Wrote " + hex((ULONG_PTR)val) + " (" + std::to_string(n) + " bytes) to " + hex(a);
             return cr;
         }
-        return {false, "unknown register: " + left};
+        CONTEXT c;
+        unsigned long long lv = 0; ULONG_PTR la = 0; DWORD lsz = 0;
+        if (ctx_display(c) && local_lookup(left, c, is64, lv, la, lsz) && la && lsz) {
+            unsigned long long val = 0;
+            if (!eval_expr(right, val)) return {false, "bad value"};
+            SIZE_T n = lsz <= sizeof(val) ? lsz : sizeof(val);
+            SIZE_T nw = 0;
+            if (!mem_write(la, &val, n, &nw)) return {false, "MemoryWriteSafe failed"};
+            CmdResult cr;
+            cr.js = "{\"variable\":\"" + js_str(left) + "\",\"value\":\"" + hex((ULONG_PTR)val) + "\"}";
+            cr.text = "Wrote " + hex((ULONG_PTR)val) + " to " + left;
+            return cr;
+        }
+        return {false, "cannot resolve: " + left};
     }
-    ULONG_PTR val = 0;
-    if (!parse_addr(right, val)) return {false, "bad value"};
-    if (!SetContextData(idx, val)) return {false, "SetContextData failed"};
+    unsigned long long val = 0;
+    if (!eval_expr(right, val)) return {false, "bad value"};
+    if (!SetContextData(idx, (ULONG_PTR)val)) return {false, "SetContextData failed"};
     CmdResult cr;
-    cr.js = "{\"register\":\"" + js_str(left) + "\",\"value\":\"" + hex(val) + "\"}";
-    cr.text = left + " = " + hex(val);
+    cr.js = "{\"register\":\"" + js_str(left) + "\",\"value\":\"" + hex((ULONG_PTR)val) + "\"}";
+    cr.text = left + " = " + hex((ULONG_PTR)val);
     return cr;
 }
 
@@ -2901,50 +3035,77 @@ static CmdResult cmd_disas(const std::vector<std::string>& args)
 }
 
 // -- backtrace (StackWalk64; works regardless of frame-pointer omission) --
+// walk the stack and cache per-frame contexts (for GDB `frame`/`up`/`down`).
+// Returns the frame pcs; on success g_frames has one FrameInfo per frame.
+static bool bt_walk(int max, std::vector<ULONG_PTR>& addrs)
+{
+    addrs.clear();
+    g_frames.clear();
+    bool is64 = target_is64();
+    PROCESS_INFORMATION* pi = TitanGetProcessInformation();
+    if (!pi || !pi->hProcess) return false;
+
+    CONTEXT base;
+    if (!ctx_display_base(base)) return false;
+
+    // frame 0 = the live top frame (context, pc)
+    ULONG_PTR base_pc = is64 ? base.Rip : reg_get(UE_EIP);
+    {
+        FrameInfo f0; f0.ctx = base; f0.pc = base_pc; f0.frameBase = 0;
+        if (is64) { CONTEXT cc = base; frame_base_rsp(cc, true, f0.frameBase); }
+        g_frames.push_back(f0);
+        addrs.push_back(base_pc);
+    }
+
+    STACKFRAME64 sf = {};
+    DWORD mach = is64 ? IMAGE_FILE_MACHINE_AMD64 : IMAGE_FILE_MACHINE_I386;
+    if (is64) {
+        sf.AddrPC.Offset = base.Rip; sf.AddrFrame.Offset = base.Rbp; sf.AddrStack.Offset = base.Rsp;
+    } else {
+        sf.AddrPC.Offset = base_pc; sf.AddrFrame.Offset = reg_get(UE_EBP); sf.AddrStack.Offset = reg_get(UE_ESP);
+    }
+    sf.AddrPC.Mode = sf.AddrFrame.Mode = sf.AddrStack.Mode = AddrModeFlat;
+
+    DWORD tid = ctx_event_tid();
+    if (g_ctx_tid && g_ctx_tid != tid) tid = g_ctx_tid;
+    HANDLE hth = NULL;
+    if (!is64) hth = OpenThread(THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, tid);
+
+    CONTEXT walk_ctx = base;
+    bool first = true;
+    std::set<ULONG_PTR> seen; seen.insert(base_pc);
+    for (int i = 1; i < max; i++) {
+        if (!StackWalk64(mach, pi->hProcess, hth, &sf, &walk_ctx, NULL,
+                         SymFunctionTableAccess64, SymGetModuleBase64, NULL))
+            break;
+        ULONG_PTR pc = (ULONG_PTR)sf.AddrPC.Offset;
+        if (!pc) break;
+        if (first) {
+            // The first StackWalk64 call reports frame 0 (base) again; skip it.
+            first = false;
+            if (pc == base_pc) continue;
+        }
+        if (seen.count(pc)) break;   // unwinder loop guard
+        seen.insert(pc);
+        FrameInfo fi; fi.ctx = walk_ctx; fi.pc = pc; fi.frameBase = 0;
+        if (is64) { CONTEXT cc = walk_ctx; frame_base_rsp(cc, true, fi.frameBase); }
+        g_frames.push_back(fi);
+        addrs.push_back(pc);
+        if (!sf.AddrReturn.Offset) break;
+    }
+    if (hth) CloseHandle(hth);
+    return true;
+}
+
 static CmdResult cmd_bt(const std::vector<std::string>& args)
 {
     if (!require_running()) return {false, "no active debug session"};
     int max = args.empty() ? 64 : atoi(args[0].c_str());
     if (max <= 0) max = 64;      // tolerate GDB's "bt full" etc.
     if (max > 256) max = 256;
-    bool is64 = target_is64();
-    PROCESS_INFORMATION* pi = TitanGetProcessInformation();
-    if (!pi || !pi->hProcess) return {false, "no debuggee process"};
-
-    CONTEXT ctx;
-    if (!ctx_display(ctx)) return {false, "cannot read thread context"};
-
-    STACKFRAME64 sf = {};
-    DWORD mach = is64 ? IMAGE_FILE_MACHINE_AMD64 : IMAGE_FILE_MACHINE_I386;
-    if (is64) {
-        sf.AddrPC.Offset = ctx.Rip; sf.AddrFrame.Offset = ctx.Rbp; sf.AddrStack.Offset = ctx.Rsp;
-    } else {
-        sf.AddrPC.Offset = reg_get(UE_EIP); sf.AddrFrame.Offset = reg_get(UE_EBP); sf.AddrStack.Offset = reg_get(UE_ESP);
-    }
-    sf.AddrPC.Mode = sf.AddrFrame.Mode = sf.AddrStack.Mode = AddrModeFlat;
-
-    DWORD tid = ctx_event_tid();
-    if (g_ctx_tid && g_ctx_tid != tid) tid = g_ctx_tid;
-    // x64 ignores hThread; x86 needs it to read stack memory
-    HANDLE hth = NULL;
-    if (!is64) hth = OpenThread(THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, tid);
 
     std::vector<ULONG_PTR> addrs;
-    std::set<ULONG_PTR> seen;
-    for (int frame = 0; frame < max; frame++) {
-        if (!StackWalk64(mach, pi->hProcess, hth, &sf, &ctx, NULL,
-                         SymFunctionTableAccess64, SymGetModuleBase64, NULL))
-            break;
-        ULONG_PTR pc = (ULONG_PTR)sf.AddrPC.Offset;
-        if (!pc) break;
-        if (seen.count(pc)) break;   // unwinder loop guard
-        seen.insert(pc);
-        addrs.push_back(pc);
-        if (!sf.AddrReturn.Offset) break;
-    }
-    if (hth) CloseHandle(hth);
-
-    if (addrs.empty()) addrs.push_back(is64 ? ctx.Rip : reg_get(UE_EIP));
+    if (!bt_walk(max, addrs)) return {false, "cannot read thread context"};
 
     std::ostringstream o, j;
     j << "[";
@@ -2959,6 +3120,28 @@ static CmdResult cmd_bt(const std::vector<std::string>& args)
     CmdResult cr;
     cr.js = j.str();
     cr.text = o.str();
+    return cr;
+}
+
+// -- frame / up / down (GDB) --
+static CmdResult cmd_frame(const std::vector<std::string>& args)
+{
+    if (!require_running()) return {false, "no active debug session"};
+    std::string op = args.empty() ? "" : args[0];
+    std::transform(op.begin(), op.end(), op.begin(), ::tolower);
+    if (g_frames.empty()) {
+        std::vector<ULONG_PTR> addrs;
+        if (!bt_walk(64, addrs)) return {false, "cannot read thread context"};
+    }
+    if (op == "up") g_frame_idx++;
+    else if (op == "down") g_frame_idx--;
+    else if (!op.empty()) g_frame_idx = atoi(op.c_str());
+    if (g_frame_idx < 0) g_frame_idx = 0;
+    if (g_frame_idx >= (int)g_frames.size()) g_frame_idx = (int)g_frames.size() - 1;
+    CmdResult cr;
+    cr.js = "{\"frame\":" + std::to_string(g_frame_idx) + "}";
+    cr.text = "#" + std::to_string(g_frame_idx) + "  " + hex(g_frames[g_frame_idx].pc) + " in "
+            + (resolve(g_frames[g_frame_idx].pc).empty() ? "??" : resolve(g_frames[g_frame_idx].pc));
     return cr;
 }
 
@@ -3380,53 +3563,9 @@ static CmdResult cmd_print(const std::string& raw_args)
         arg = arg.substr(b);
     }
     bool is64 = target_is64();
-    bool deref = false;
-    std::string expr = arg;
-    if (!expr.empty() && expr[0] == '*') { deref = true; expr = expr.substr(1); }
-    ULONG_PTR val = 0;
-    if (!expr.empty() && expr[0] == '$') {
-        DWORD idx = reg_index_for_name(expr.substr(1), is64);
-        if (!idx) return {false, "unknown register: " + expr.substr(1)};
-        val = reg_get(idx);
-    } else if (!deref && !expr.empty() &&
-               (isalpha((unsigned char)expr[0]) || expr[0] == '_')) {
-        // bare identifier: a PDB data symbol prints its VALUE (GDB `print var`);
-        // a function symbol prints its address (GDB `print func`).
-        ULONG_PTR a = 0;
-        if (sym_lookup(expr, a)) {
-            // function symbols live in an executable region: print their address
-            // (GDB `print func`); data symbols: print the value stored at them.
-            bool is_func = false;
-            PROCESS_INFORMATION* pi = TitanGetProcessInformation();
-            if (pi && pi->hProcess) {
-                MEMORY_BASIC_INFORMATION mbi = {};
-                if (VirtualQueryEx(pi->hProcess, (LPCVOID)a, &mbi, sizeof(mbi))) {
-                    DWORD prot = mbi.Protect & 0xFF;
-                    is_func = prot == PAGE_EXECUTE || prot == PAGE_EXECUTE_READ ||
-                              prot == PAGE_EXECUTE_READWRITE || prot == PAGE_EXECUTE_WRITECOPY;
-                }
-            }
-            if (is_func) {
-                val = a;
-            } else {
-                SIZE_T n = sizeof(ULONG_PTR), nr = 0;
-                if (!mem_read(a, &val, n, &nr) || nr < n) return {false, "memory read failed"};
-            }
-        } else {
-            ULONG_PTR a2 = 0;
-            if (!parse_addr(expr, a2)) return {false, "cannot parse expression: " + expr};
-            val = a2;
-        }
-    } else {
-        ULONG_PTR a = 0;
-        if (!parse_addr(expr, a)) return {false, "cannot parse expression: " + expr};
-        val = a;
-    }
-    if (deref) {
-        SIZE_T n = is64 ? 8 : 4, nr = 0;
-        if (!mem_read(val, &val, n, &nr) || nr < n) return {false, "memory read failed"};
-    }
-    std::string h = hex(val);
+    unsigned long long val = 0;
+    if (!eval_expr(arg, val)) return {false, "cannot parse expression: " + arg};
+    std::string h = hex((ULONG_PTR)val);
     std::string dv = std::to_string((unsigned long long)val);
     CmdResult cr;
     cr.js = "{\"expression\":\"" + js_str(arg) + "\",\"value\":\"" + h + "\",\"decimal\":\"" + dv + "\"}";
@@ -3720,6 +3859,9 @@ static CmdResult execute(const std::string& line)
     if (cmd == "dump") return cmd_dump(std::vector<std::string>(tok.begin()+1, tok.end()));
     if (cmd == "disas" || cmd == "u" || cmd == "disassemble") return cmd_disas(std::vector<std::string>(tok.begin()+1, tok.end()));
     if (cmd == "bt" || cmd == "backtrace" || cmd == "where") return cmd_bt(std::vector<std::string>(tok.begin()+1, tok.end()));
+    if (cmd == "frame") return cmd_frame(std::vector<std::string>(tok.begin()+1, tok.end()));
+    if (cmd == "up") return cmd_frame(std::vector<std::string>(tok.begin(), tok.end()));
+    if (cmd == "down") return cmd_frame(std::vector<std::string>(tok.begin(), tok.end()));
     if (cmd == "list" || cmd == "l") return cmd_list(std::vector<std::string>(tok.begin()+1, tok.end()));
     if (cmd == "thread") return cmd_thread(std::vector<std::string>(tok.begin()+1, tok.end()));
     if (cmd == "search") return cmd_search(std::vector<std::string>(tok.begin()+1, tok.end()));

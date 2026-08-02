@@ -132,7 +132,7 @@ echo / help / quit(q)
 | `break <addr>` / `*addr` | 按地址设断点 | 同左 | ✅ | 4.1 |
 | `hbreak <addr\|sym> [r/w/x]` | 硬件断点 | 同左 | ✅ | 4.17/4.18 |
 | `watch` / `rwatch` / `awatch` | 数据观察点 | 同左（TitanEngine guard-page，页级粒度） | ⚠️ | 4.3 |
-| `condition <id> [expr]` | 断点条件 | 同左（不支持局部变量名） | ⚠️ | 4.2b |
+| `condition <id> [expr]` | 断点条件 | 同左（支持局部变量，求值失败保守停止） | ✅ | 4.2b/4.27 |
 | `ignore <id> <count>` | 忽略前 N 次命中 | 同左 | ✅ | 4.2 |
 | `delete` / `disable` / `enable` | 删除/禁用/启用断点 | 同左（无参 = 全部） | ✅ | 4.12 |
 | `mbreak <addr> <size>` | — | aidbg 独有（内存范围断点） | ⓘ | 4.3 |
@@ -143,6 +143,7 @@ echo / help / quit(q)
 | `info locals` / `info args` | 局部变量 / 函数参数 | 同左（需完整 PDB，见已知边界） | ✅ | 4.6 |
 | `thread <id>` | 切换线程 | 同左（内部编号或 OS TID） | ✅ | 4.7b |
 | `info threads` | 列出线程 | 同左（`*` 标当前线程） | ✅ | 4.7 |
+| `frame <N>` / `up` / `down` | 帧导航 | 同左（`info locals`/`print`/`registers` 按选中帧） | ✅ | 4.29 |
 
 ### 源码与符号（Source / Symbols）
 
@@ -152,11 +153,11 @@ echo / help / quit(q)
 
 ### 数据（Data）
 
-| `print` / `p` | 打印表达式 | 支持 `$reg` / 字面量 / `*addr` / 全局符号（数据打印值、函数打印地址）；**不支持局部标识符与表达式** | ⚠️ | 4.6/4.25 |
+| `print` / `p` | 打印表达式 | 支持 `$reg` / 字面量 / `*addr` / **局部变量** / 全局符号（函数打印地址）/ 算术表达式；**不支持数组下标/成员/`&`** | ✅ | 4.6/4.25/4.26 |
 | `x/<n><fmt> <addr>` | 检视内存 | 同左（b/h/w/g + x/d/u/i/s/c/f，支持符号） | ✅ | 4.12/4.25 |
-| `dump <addr>` | 原始 hex+ascii 转储 | 同左 | ✅ | 4.23 |
-| `set $reg = <val>` | 写寄存器 | 同左 | ✅ | 4.6 |
+| `set $reg = <val>` | 写寄存器 | 同左（右侧支持表达式） | ✅ | 4.6/4.28 |
 | `set *addr = <val>` | 写内存 | 同左（支持符号地址） | ✅ | 4.6/4.25 |
+| `set <局部变量> = <val>` | 写局部变量 | 同左 | ✅ | 4.28 |
 | `registers` / `regs` | `info registers` 快捷别名 | 同左 | ✅ | — |
 
 ### 反汇编与工具（Disassembly / Misc）
@@ -181,13 +182,28 @@ echo / help / quit(q)
 驻留进程）+ 自动化用例，覆盖断点、条件 / ignore、内存观察点、异常、单步、
 源码级 `step`/`next`、变量枚举、线程切换、attach/detach、搜索、行号断点、
 bp 命中后上下文命令、GDB 兼容性（含 4.21 命令走查、4.22 批处理退出码、
-4.25 符号解析），全部通过（31 项）：
+4.25 符号解析、4.26–4.29 局部变量/表达式/帧导航），全部通过（35 项）：
 
 ```cmd
 set _NT_SYMBOL_PATH=%CD%\..
 tests\build.cmd
 tests\run_tests.cmd        :: 全绿返回 0，可接入 CI
 ```
+
+## Roadmap
+
+A. ~~局部变量 + 表达式求值~~（**已实现**，handover7：`print`/`condition`/`set`
+   局部变量与表达式、`frame`/`up`/`down` 帧导航，用例 4.26–4.29）
+B. AI 接口增强
+- --host/--port 长驻 socket 协议（一次会话多命令，免每次启动进程）
+- JSON 结构化增强（dump/x 字节数组、断点字段补全）
+C. 引擎稳定与边界
+- WOW64 下 info locals/bt/thread 的 32 位展开验证
+- list 支持非 ASCII 源文件路径（std::ifstream 窄路径改宽字符）
+- set scheduler-locking on|off（GDB 多线程步进选项）
+D. 断点高级
+- commands <id> 断点命令列表（自动 continue 等）
+- until / advance <loc> 运行到指定位置
 
 ## 文档
 
@@ -200,8 +216,9 @@ tests\run_tests.cmd        :: 全绿返回 0，可接入 CI
 
 ## 已知边界
 
-- `print <局部标识符>`、`condition` 局部变量未实现（`print` 支持 `$reg`/字面量/
-  `*addr`/**全局符号**：数据符号打印值、函数符号打印地址）。
+- `print`/`condition`/`set` 支持局部变量与表达式（handover7）；**数组下标 /
+  成员访问 / `&` 取址暂不支持**（求值器按值计算，用 `print *ptr` 解引用替代）。
+- `print` 支持 `$reg`/字面量/`*addr`/全局符号（数据打印值、函数打印地址）。
 - `disas`/`x`/`set`/`print` 支持 PDB 符号（`parse_addr` 符号回退，handover6）；
   `break`/`list`/`hbreak`/`watch`/`mbreak`/`condition` 亦支持。
 - 源码级 `step`/`next` 已实现（`archive/handover5.md`）；无 PDB 行号时回退指令级单步

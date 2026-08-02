@@ -15,6 +15,7 @@ tests/
     test_threads.c     多线程：两个工作线程 + 主线程
     test_symbols.c     符号与源码定位：add() 函数
     test_source_step.c 源码级 step/next：callee() + 循环
+    test_vars.c        局部变量 / 表达式 / 帧导航：level2 -> level1 -> main
     test_attach.c      常驻目标：供 attach/detach 测试
   cases/               各测试用例的 aidbg 命令脚本（TestGuid.md 第 4 节）
   build.cmd            MSVC 编译脚本（方案 B 专用参数，见下）
@@ -84,6 +85,10 @@ cl /nologo /Zi /Od /Oy- /GS- /MTd /Fe:<target>.exe <target>.c /link /DEBUG:FULL 
 | 4.23 | `case_4_23_context_cmds.txt` | bp 命中后上下文查看命令 | `registers`/`x` 多格式/`dump`/`print` 多格式/`set *addr`/`info modules\|target\|events`/`show args\|source-checksum`/`echo`/`nexti` |
 | 4.24 | `case_4_24_bp_ops.txt` | bp 命中后断点管理 + 观察点变体 | `disable`/`enable`（`keep n/y`）、`delete`、`watch`/`rwatch`/`mbreak` |
 | 4.25 | `case_4_25_sym_addr.txt` | 符号解析：`disas`/`x`/`set`/`print`（handover6 P0/P1） | `disas func2, func2+0x10` 反汇编、`print global_var`→42、`print func2`→地址、`x global_var`、`set *global_var=5` 后 `print`→5 |
+| 4.26 | `case_4_26_print_expr.txt` | `print` 局部变量与表达式（handover7） | `print local_sum`→36、`local_prod`→180、`a+b`→216、`a*b`→6480 |
+| 4.27 | `case_4_27_condition_local.txt` | `condition` 用局部变量 | `condition 2 local_x2 == 6`（level1(3)）停到 `level1` |
+| 4.28 | `case_4_28_set_local.txt` | `set` 局部变量 + 表达式右侧 | `set local_sum = 50`、`set local_prod = local_sum + 5`（55） |
+| 4.29 | `case_4_29_frame.txt` | `frame N` 帧导航 + 按帧 `info locals` | `frame 1`→level1 的 `local_x2=6`；`frame 2`→main 的 `v` |
 
 > **断点编号**：`start` 的一次性入口断点占用 id 1（GDB 一致），因此 4.2/4.2b 的
 > `break func1` 为 id 2、4.9 的 `break add` 为 id 2，脚本与断言均已按此编号。

@@ -1,0 +1,13 @@
+# Case 4.29 - frame navigation: frame N / info locals per frame (handover7)
+# Target: test_vars.exe
+# `frame 1` shows level1's locals, `frame 2` shows main's locals.
+file test_vars.exe
+start
+break 21
+continue
+bt
+frame 1
+info locals
+frame 2
+info locals
+quit

@@ -1,0 +1,10 @@
+# Case 4.27 - condition with a local variable (handover7)
+# Target: test_vars.exe
+# level1(3) sets local_x2 = 6; the breakpoint only stops when it matches.
+file test_vars.exe
+start
+break 34
+condition 2 local_x2 == 6
+continue
+where
+quit

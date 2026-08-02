@@ -1,0 +1,12 @@
+# Case 4.28 - set local variable + expression RHS (handover7)
+# Target: test_vars.exe
+# `set <local> = <expr>` writes the local; the RHS is a full expression.
+file test_vars.exe
+start
+break 21
+continue
+set local_sum = 50
+print local_sum
+set local_prod = local_sum + 5
+print local_prod
+quit

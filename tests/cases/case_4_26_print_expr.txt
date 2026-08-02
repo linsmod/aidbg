@@ -1,0 +1,13 @@
+# Case 4.26 - print local variables and expressions (handover7)
+# Target: test_vars.exe
+# `print <local>` reads a frame local; `print a+b` / `print a*b` evaluate.
+file test_vars.exe
+start
+break 21
+continue
+print local_sum
+print local_prod
+print local_sum + local_prod
+print local_sum * local_prod
+print $rax
+quit

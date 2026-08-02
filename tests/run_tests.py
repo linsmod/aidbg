@@ -41,7 +41,7 @@ PYTHON = sys.executable
 
 TARGETS = ["test_basic", "test_memory", "test_exception", "test_threads",
            "test_symbols", "test_attach", "test_checksum", "test_debugbreak",
-           "test_source_step"]
+           "test_source_step", "test_vars"]
 
 # x86 (WoW64) targets are built with a separate script; aidbg (x64) debugs them
 # cross-architecture, which exercises the STATUS_WX86_BREAKPOINT path.
@@ -658,6 +658,34 @@ CASES = [
         "script": "case_4_25_sym_addr.txt",
         "expect": ["MOV", "value = 0x000000000000002a", "value = 0x00000001400075e0",
                    "Wrote 0x0000000000000005", "value = 0x0000000000000005"],
+    },
+    {
+        "id": "4.26",
+        "name": "print local vars + expressions",
+        "script": "case_4_26_print_expr.txt",
+        "expect": ["Stopped: breakpoint", "value = 0x0000000000000024",
+                   "value = 0x00000000000000b4", "value = 0x00000000000000d8",
+                   "value = 0x0000000000001950"],
+    },
+    {
+        "id": "4.27",
+        "name": "condition with a local variable",
+        "script": "case_4_27_condition_local.txt",
+        "expect": ["Breakpoint 2 condition: local_x2 == 6", "level1 () at test_vars.c:34"],
+    },
+    {
+        "id": "4.28",
+        "name": "set local variable + expr RHS",
+        "script": "case_4_28_set_local.txt",
+        "expect": ["Wrote 0x0000000000000032 to local_sum", "value = 0x0000000000000032",
+                   "Wrote 0x0000000000000037 to local_prod", "value = 0x0000000000000037"],
+    },
+    {
+        "id": "4.29",
+        "name": "frame navigation + per-frame info locals",
+        "script": "case_4_29_frame.txt",
+        "expect": ["level1+0x6c (test_vars.c:34)", "local_x2", "0x0000000000000006",
+                   "main+0x16 (test_vars.c:42)", "v                       int"],
     },
 ]
 

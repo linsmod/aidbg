@@ -1,0 +1,140 @@
+name: publish
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      release-tag:
+        description: 'GitHub release tag to publish, e.g. v0.1.0'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release-tag || github.ref_name }}
+  WINGET_ID: linsmod.aidbg
+
+jobs:
+  build:
+    runs-on: windows-latest
+    outputs:
+      release-tag: ${{ steps.meta.outputs.release-tag }}
+      version: ${{ steps.meta.outputs.version }}
+      zip-name: ${{ steps.meta.outputs.zip-name }}
+      zip-url: ${{ steps.meta.outputs.zip-url }}
+      sha256: ${{ steps.package.outputs.sha256 }}
+      repo-name: ${{ steps.meta.outputs.repo-name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Metadata
+        id: meta
+        shell: pwsh
+        run: |
+          $tag = $env:RELEASE_TAG
+          if ($tag -notmatch '^v?\d+\.\d+\.\d+$') {
+            Write-Error "RELEASE_TAG '$tag' is not a valid version tag (e.g. v0.1.0)"
+            exit 1
+          }
+          $ver = $tag -replace '^v', ''
+          "release-tag=$tag" >> $env:GITHUB_OUTPUT
+          "version=$ver" >> $env:GITHUB_OUTPUT
+          "zip-name=aidbg-x64-$tag.zip" >> $env:GITHUB_OUTPUT
+          "zip-url=https://github.com/$env:GITHUB_REPOSITORY/releases/download/$tag/aidbg-x64-$tag.zip" >> $env:GITHUB_OUTPUT
+          "repo-name=$($env:GITHUB_REPOSITORY.Substring($env:GITHUB_REPOSITORY.IndexOf('/') + 1))" >> $env:GITHUB_OUTPUT
+
+      - name: Configure
+        run: cmake -S . -B build -A x64
+
+      - name: Build (Release)
+        run: cmake --build build --config Release
+
+      - name: Build test targets
+        run: tests\build.cmd
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run test suite
+        run: tests\run_tests.cmd
+
+      - name: Package zip
+        id: package
+        shell: pwsh
+        run: |
+          $zip = "aidbg-x64-$env:RELEASE_TAG.zip"
+          Push-Location build\bin
+          try {
+            Compress-Archive -Path aidbg.exe, TitanEngine.dll -DestinationPath "$env:GITHUB_WORKSPACE\$zip" -Force
+          } finally {
+            Pop-Location
+          }
+          $hash = (Get-FileHash "$env:GITHUB_WORKSPACE\$zip" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "sha256=$hash" >> $env:GITHUB_OUTPUT
+
+      - name: Upload zip to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          files: aidbg-x64-${{ env.RELEASE_TAG }}.zip
+          overwrite: true
+
+  winget:
+    runs-on: ubuntu-latest
+    needs: build
+    # NOTE: linsmod.aidbg must already exist in microsoft/winget-pkgs before
+    # this action runs (it only publishes updates). Submit the first version
+    # manually once:  wingetcreate update linsmod.aidbg --urls <zip> --submit
+    steps:
+      - name: Publish to WinGet
+        uses: vedantmgoyal9/winget-releaser@v2
+        with:
+          identifier: ${{ env.WINGET_ID }}
+          version: ${{ needs.build.outputs.version }}
+          installers-regex: 'aidbg-x64-.*\.zip$'
+          max-versions-to-keep: 0
+          release-repository: ${{ needs.build.outputs.repo-name }}
+          release-tag: ${{ needs.build.outputs.release-tag }}
+          release-notes-url: https://github.com/${{ github.repository }}/releases/tag/${{ needs.build.outputs.release-tag }}
+          token: ${{ secrets.WINGET_TOKEN }}
+          fork-user: ${{ github.repository_owner }}
+
+  chocolatey:
+    runs-on: windows-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pack nupkg
+        id: pack
+        shell: pwsh
+        run: |
+          $tag = "${{ needs.build.outputs.release-tag }}"
+          $ver = "${{ needs.build.outputs.version }}"
+          $url = "${{ needs.build.outputs.zip-url }}"
+          $sha = "${{ needs.build.outputs.sha256 }}"
+          $stage = Join-Path $env:RUNNER_TEMP "choco-$tag"
+          $tools = Join-Path $stage "tools"
+          New-Item -ItemType Directory -Path $tools -Force | Out-Null
+          Copy-Item "packaging\chocolatey\aidbg.nuspec" $stage
+          Copy-Item "packaging\chocolatey\tools\chocolateyinstall.ps1" $tools
+          $script = (Get-Content -LiteralPath "$tools\chocolateyinstall.ps1" -Raw)
+          $script = $script.Replace('__URL__', $url).Replace('__SHA256__', $sha)
+          Set-Content -LiteralPath "$tools\chocolateyinstall.ps1" -Value $script -Encoding utf8
+          choco pack "$stage\aidbg.nuspec" --version $ver --out $env:RUNNER_TEMP
+
+      - name: Push to Chocolatey
+        shell: pwsh
+        env:
+          CHOCO_API_KEY: ${{ secrets.CHOCO_API_KEY }}
+        run: |
+          $nupkg = (Get-ChildItem "$env:RUNNER_TEMP\aidbg.${{ needs.build.outputs.version }}.nupkg").FullName
+          choco push $nupkg --source "https://push.chocolatey.org/" --api-key $env:CHOCO_API_KEY

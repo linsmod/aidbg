@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  aidbg.nuspec - Chocolatey package metadata.
+
+  The version is set at pack time by the publish workflow (choco pack, with a
+  version override), so the placeholder here is intentionally 0.0.0. The
+  description uses the $version$ token, which choco pack expands to the real
+  version.
+-->
+<package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
+  <metadata>
+    <id>aidbg</id>
+    <title>aidbg</title>
+    <version>0.0.0</version>
+    <authors>linsmod</authors>
+    <owners>linsmod</owners>
+    <summary>GDB-style Windows command-line debugger built for AI agents and automation.</summary>
+    <description><![CDATA[
+aidbg is a single-file C++17 Windows native debugger based on TitanEngine. It
+exposes a GDB-aligned command set plus a JSON Lines machine interface, designed
+for AI coding assistants, CI automation and scripted debugging.
+
+- GDB-compatible commands: run / start / continue / stepi / nexti / finish / bt / break / hbreak / mbreak / watch / condition / ignore / registers / set / x / dump / disas / search / strings / info / attach / detach / thread
+- JSON Lines machine interface (--json): single-line JSON events / results / errors
+- Process-level one-shot commands: --command, --commands, stdin pipe
+- Software / hardware / memory breakpoints plus dll!api breakpoints
+- Deep PDB symbol support with source/PDB checksum validation
+- Exception interception, multi-thread support, attach/detach
+
+This is version $version$. See https://github.com/linsmod/-vc-dev-debuging-tool-for-ai-agent
+for full usage and documentation.
+]]></description>
+    <projectUrl>https://github.com/linsmod/-vc-dev-debuging-tool-for-ai-agent</projectUrl>
+    <projectSourceUrl>https://github.com/linsmod/-vc-dev-debuging-tool-for-ai-agent</projectSourceUrl>
+    <packageSourceUrl>https://github.com/linsmod/-vc-dev-debuging-tool-for-ai-agent</packageSourceUrl>
+    <docsUrl>https://github.com/linsmod/-vc-dev-debuging-tool-for-ai-agent/blob/master/README.md</docsUrl>
+    <releaseNotes>See https://github.com/linsmod/-vc-dev-debuging-tool-for-ai-agent/releases</releaseNotes>
+    <licenseUrl>https://www.gnu.org/licenses/lgpl-3.0.html</licenseUrl>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <tags>debugger gdb windows cli ai automation json titanengine</tags>
+  </metadata>
+  <files>
+    <file src="tools\**" target="tools" />
+  </files>
+</package>

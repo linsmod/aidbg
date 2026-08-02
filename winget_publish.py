@@ -261,13 +261,6 @@ def sync_fork_master(token, fork, upstream_master):
 
 def create_branch_commit(token, fork, branch, version, master_sha, master_tree,
                          files):
-    try:
-        api(token, "DELETE", "/repos/%s/git/refs/heads/%s" % (fork, branch))
-        log("removed stale branch %s" % branch)
-    except ApiError as exc:
-        if exc.code != 422:
-            raise
-
     blobs = {}
     for path, content in files.items():
         payload = {
@@ -294,8 +287,18 @@ def create_branch_commit(token, fork, branch, version, master_sha, master_tree,
     commit_sha = api(token, "POST", "/repos/%s/git/commits" % fork, commit)[
         "sha"]
 
-    api(token, "POST", "/repos/%s/git/refs" % fork,
-        {"ref": "refs/heads/%s" % branch, "sha": commit_sha})
+    # Force-update the branch in place when it exists; deleting and recreating
+    # it would make GitHub auto-close any open PR on that branch.
+    try:
+        api(token, "PATCH", "/repos/%s/git/refs/heads/%s" % (fork, branch),
+            {"sha": commit_sha, "force": True})
+        log("updated branch %s in place" % branch)
+    except ApiError as exc:
+        if exc.code != 422:
+            raise
+        api(token, "POST", "/repos/%s/git/refs" % fork,
+            {"ref": "refs/heads/%s" % branch, "sha": commit_sha})
+        log("created branch %s" % branch)
     return commit_sha
 
 

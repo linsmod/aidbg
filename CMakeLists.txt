@@ -6,7 +6,31 @@ endif()
 
 cmake_policy(SET CMP0091 NEW)
 
-project(aidbg LANGUAGES C CXX)
+project(aidbg VERSION 0.1.0 LANGUAGES C CXX)
+
+# ---- version metadata from git (used by aidbg.rc and the --version flag) ----
+execute_process(
+    COMMAND git rev-parse --short HEAD
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    OUTPUT_VARIABLE AIDBG_GIT_HASH
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+if(NOT AIDBG_GIT_HASH)
+    set(AIDBG_GIT_HASH "unknown")
+endif()
+execute_process(
+    COMMAND git status --porcelain
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    OUTPUT_VARIABLE AIDBG_GIT_DIRTY_OUT
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+set(AIDBG_GIT_DIRTY 0)
+set(AIDBG_GIT_SUFFIX "")
+if(AIDBG_GIT_DIRTY_OUT)
+    set(AIDBG_GIT_DIRTY 1)
+    set(AIDBG_GIT_SUFFIX "-dirty")
+endif()
+configure_file(aidbg.rc.in "${CMAKE_CURRENT_BINARY_DIR}/aidbg.rc" @ONLY)
 
 if(NOT WIN32)
     message(FATAL_ERROR "aidbg only supports Windows")
@@ -32,8 +56,12 @@ endif()
 set(TITANENGINE_RESOURCES ON CACHE BOOL "Build TitanEngine resources" FORCE)
 add_subdirectory(third_party/TitanEngine)
 
-add_executable(aidbg aidbg.cpp aidbg.rc)
+add_executable(aidbg aidbg.cpp "${CMAKE_CURRENT_BINARY_DIR}/aidbg.rc")
 target_compile_features(aidbg PRIVATE cxx_std_17)
+target_compile_definitions(aidbg PRIVATE
+    AIDBG_VERSION="${PROJECT_VERSION}"
+    AIDBG_GIT_HASH="${AIDBG_GIT_HASH}"
+    AIDBG_GIT_DIRTY=${AIDBG_GIT_DIRTY})
 target_link_libraries(aidbg PRIVATE TitanEngine)
 
 if(MSVC)

@@ -62,6 +62,18 @@
 #include <cctype>
 #include <fstream>
 
+// Version + git commit are injected at build time by CMake (AIDBG_VERSION,
+// AIDBG_GIT_HASH); keep safe fallbacks for IDE/standalone builds.
+#ifndef AIDBG_VERSION
+#define AIDBG_VERSION "0.1.0"
+#endif
+#ifndef AIDBG_GIT_HASH
+#define AIDBG_GIT_HASH "unknown"
+#endif
+#ifndef AIDBG_GIT_DIRTY
+#define AIDBG_GIT_DIRTY 0
+#endif
+
 // ------------------------------------------------------------- TitanEngine ---
 
 #define TITCALL
@@ -3662,6 +3674,8 @@ static const char* HELP =
 "  aidbg --batch -ex \"run\" -ex \"bt\" --args myprog.exe arg1 arg2\n"
 "  (exit code is 0 on success, nonzero if the inferior crashed or a command errored)\n"
 "\n"
+"  --version / -V              print version and git commit, then exit\n"
+"\n"
 "  file <path>                 set target executable\n"
 "  run [args] / r              start debugging (stops at initial breakpoint)\n"
 "  start [func]                like run, but stop at the entry function (main by default)\n"
@@ -3988,6 +4002,10 @@ int main(int argc, char** argv)
             if (i + 1 < argc) script_file = argv[++i];
         } else if (a == "--help" || a == "-h") {
             printf("%s", HELP);
+            return 0;
+        } else if (a == "--version" || a == "-V") {
+            printf("aidbg %s%s (commit %s)\n", AIDBG_VERSION,
+                   AIDBG_GIT_DIRTY ? "-dirty" : "", AIDBG_GIT_HASH);
             return 0;
         } else if (!a.empty() && a[0] == '-') {
             fprintf(stderr, "unknown option: %s\n", a.c_str());

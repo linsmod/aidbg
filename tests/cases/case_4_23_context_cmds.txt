@@ -1,0 +1,27 @@
+# Case 4.23 - bp-hit contextual inspect commands (README "GDB 兼容命令清单")
+# Target: test_basic.exe
+# Covers commands implemented but previously untested in the stopped-at-a-
+# breakpoint context: registers, x formats, dump, print formats, memory write,
+# info modules/target/events, show args/source-checksum, echo, nexti.
+file test_basic.exe
+start
+break func2
+continue
+registers
+x/4gx $rsp
+x/1w $rsp
+x/2b $rsp
+dump $rsp 16
+p/x $rax
+p/d $rax
+p/t $rax
+print *0x140000000
+set *$rsp = 0x1234
+info modules
+info target
+info events
+show args
+show source-checksum
+echo bp-hit-context
+nexti
+quit

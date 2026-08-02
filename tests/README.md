@@ -81,6 +81,9 @@ cl /nologo /Zi /Od /Oy- /GS- /MTd /Fe:<target>.exe <target>.c /link /DEBUG:FULL 
 | 4.20 | `case_4_20_source_next.txt` | 源码级 `next`（跳过调用/循环） | `next` 越过 `callee()` 停到下一行，`next` 进循环体、`next 2` 全速跑完循环 |
 | 4.21 | `case_4_21_gdb_compat2.txt` | GDB 兼容命令走查（man page 核心） | `start`→`break 29`→`continue`→`step` 进 `callee`→`bt`→`next`→`finish` 回 main→`list` 标当前行 |
 | 4.22 | （运行器动态驱动） | GDB 调用兼容（--batch 退出码、`-e`） | `--batch` 成功退出 0、命令出错退出非 0；`-e <file>` 选中目标并运行 |
+| 4.23 | `case_4_23_context_cmds.txt` | bp 命中后上下文查看命令 | `registers`/`x` 多格式/`dump`/`print` 多格式/`set *addr`/`info modules\|target\|events`/`show args\|source-checksum`/`echo`/`nexti` |
+| 4.24 | `case_4_24_bp_ops.txt` | bp 命中后断点管理 + 观察点变体 | `disable`/`enable`（`keep n/y`）、`delete`、`watch`/`rwatch`/`mbreak` |
+| 4.25 | `case_4_25_sym_addr_xfail.txt` | **已知缺口（xfail）**：`disas <符号>` / `print <全局>` | GDB 支持符号解析；aidbg `parse_addr` 不支持 → `bad address`/`cannot parse expression`。保留 xfail 使缺口可见而套件保持绿色 |
 
 > **断点编号**：`start` 的一次性入口断点占用 id 1（GDB 一致），因此 4.2/4.2b 的
 > `break func1` 为 id 2、4.9 的 `break add` 为 id 2，脚本与断言均已按此编号。

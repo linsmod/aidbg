@@ -1,0 +1,19 @@
+# Case 4.24 - bp-hit breakpoint management + watch variants (README)
+# Target: test_basic.exe
+# Covers disable/enable/delete and watch/rwatch/mbreak in the stopped context.
+file test_basic.exe
+start
+break func2
+continue
+disable 2
+info break
+enable 2
+info break
+watch g_loop_index 4
+rwatch global_var 4
+mbreak $rsp 4 r
+info break
+break func1
+delete 6
+info break
+quit

@@ -637,6 +637,28 @@ CASES = [
         "expect": None,
         "dynamic": "batchcompat",
     },
+    {
+        "id": "4.23",
+        "name": "bp-hit contextual inspect commands",
+        "script": "case_4_23_context_cmds.txt",
+        "expect": ["Stopped: breakpoint", "value = 0x0000000000000000",
+                   "value = 0x0000000300905a4d", "Wrote 0x0000000000001234",
+                   "test_basic.exe", "loaddll", "args = (none)",
+                   "source-checksum = off", "bp-hit-context", "func2+0x4"],
+    },
+    {
+        "id": "4.24",
+        "name": "bp-hit breakpoint mgmt + watch variants",
+        "script": "case_4_24_bp_ops.txt",
+        "expect": ["keep n", "keep y", "Memory breakpoint 5", "mem/watch", "deleted 6"],
+    },
+    {
+        "id": "4.25",
+        "name": "disas <symbol> / print <global> (KNOWN GAP)",
+        "script": "case_4_25_sym_addr_xfail.txt",
+        "expect": ["MOV", "value = 42"],
+        "xfail": "parse_addr does not resolve PDB symbols for disas/print",
+    },
 ]
 
 

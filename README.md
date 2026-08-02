@@ -152,7 +152,7 @@ echo / help / quit(q)
 
 ### 数据（Data）
 
-| `print` / `p` | 打印表达式 | 支持 `$reg` / 字面量 / `*addr` / 全局符号；**不支持表达式与局部标识符** | ⚠️ | 4.6 |
+| `print` / `p` | 打印表达式 | 支持 `$reg` / 字面量 / `*addr`；**不支持裸标识符**（见已知边界） | ⚠️ | 4.6/4.25 |
 | `x/<n><fmt> <addr>` | 检视内存 | 同左（b/h/w/g + x/d/u/i/s/c/f） | ✅ | 4.12 |
 | `set $reg = <val>` | 写寄存器 | 同左 | ✅ | 4.6 |
 | `set *addr = <val>` | 写内存 | 同左 | ✅ | 4.6 |
@@ -179,7 +179,8 @@ echo / help / quit(q)
 `tests/` 套件：7 个测试目标（基础 / 内存 / 异常 / 多线程 / 符号 / 源码单步 /
 驻留进程）+ 自动化用例，覆盖断点、条件 / ignore、内存观察点、异常、单步、
 源码级 `step`/`next`、变量枚举、线程切换、attach/detach、搜索、行号断点、
-GDB 兼容性（含 4.21 命令走查与 4.22 批处理退出码核对），全部通过：
+bp 命中后上下文命令、GDB 兼容性（含 4.21 命令走查、4.22 批处理退出码、
+4.25 已知缺口 xfail），全部通过（31 项）：
 
 ```cmd
 set _NT_SYMBOL_PATH=%CD%\..
@@ -199,6 +200,8 @@ tests\run_tests.cmd        :: 全绿返回 0，可接入 CI
 ## 已知边界
 
 - `print <裸标识符>`、`condition` 局部变量未实现（`print` 支持 `$reg`/字面量/`*addr`）。
+- `disas <符号>` 与 `print <全局符号>` 暂不支持 PDB 符号解析（`parse_addr` 不解析
+  符号名），用例 4.25 以 xfail 记录；`break`/`list`/`hbreak`/`watch` 已支持符号。
 - 源码级 `step`/`next` 已实现（`archive/handover5.md`）；无 PDB 行号时回退指令级单步
   （`stepi`/`nexti`）并提示。
 - 32 位（WOW64）目标已支持（软件/硬件断点、单步；用例 4.16–4.18）。

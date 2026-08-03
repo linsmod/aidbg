@@ -268,14 +268,18 @@ tests\run_tests.cmd        :: green, returns 0, CI-ready
 - [x] **Locals + expression evaluation** (done, handover7): `print`/`condition`/`set`
   support local variables and arithmetic expressions; `frame`/`up`/`down` navigation
   (cases 4.26–4.29)
+- [x] **WOW64 unwinding for `bt` / `info locals` / `info args`** (done, handover8): a packed
+  x86 `WOW64_CONTEXT` fed to StackWalk64 walks 32-bit stacks (cases 4.16–4.18); crash stops
+  use the real 32-bit context (rip/registers/bt match VS) and memory reads after a crash no
+  longer deadlock (case 4.33)
+- [x] **Breakpoint command lists** (done, handover8): `commands <id>` / `silent` / `end`,
+  commands auto-run on each hit, embedded `continue` resumes (case 4.32)
 - [ ] **AI interface enhancements**: long-lived `--host/--port` socket protocol (multiple
   commands per session, no per-command process spawn); richer JSON (dump/x byte arrays,
   fuller breakpoint fields)
-- [ ] **Engine stability & edges**: WOW64 32-bit unwinding for `info locals`/`thread`
-  (`bt` done — StackWalk64 on a packed x86 context, cases 4.16/4.18);
-  `list` with non-ASCII source paths (wide-char open); `set scheduler-locking on|off`
-- [ ] **Advanced breakpoints**: `commands <id>` breakpoint command lists (auto-continue,
-  etc.); `until` / `advance <loc>` run-to-location
+- [ ] **Engine edges**: `list` with non-ASCII source paths (wide-char open);
+  `set scheduler-locking on|off`
+- [ ] `until` / `advance <loc>` run-to-location
 
 ## Documentation
 
@@ -288,8 +292,8 @@ tests\run_tests.cmd        :: green, returns 0, CI-ready
 ## Known limitations
 
 - `print`/`condition`/`set` support locals and expressions (handover7); **array
-  subscripts / member access / `&` are not yet supported** (the evaluator is value-based;
-  use `print *ptr` to dereference instead).
+  subscripts and member access are not yet supported** (the evaluator is value-based;
+  use `print *ptr` to dereference instead). Unary `&` (address-of) is supported.
 - `print` supports `$reg` / literals / `*addr` / global symbols (data prints its value,
   functions print their address).
 - `disas`/`x`/`set`/`print` support PDB symbols (`parse_addr` symbol fallback, handover6);

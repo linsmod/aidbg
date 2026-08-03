@@ -254,13 +254,16 @@ tests\run_tests.cmd        :: 全绿返回 0，可接入 CI
 
 - [x] **局部变量 + 表达式求值**（已实现，handover7）：`print`/`condition`/`set` 支持
   局部变量与算术表达式；`frame`/`up`/`down` 帧导航（用例 4.26–4.29）
+- [x] **WOW64 下 `bt` / `info locals` / `info args` 的 32 位展开**（已实现，handover8）：
+  x86 布局 `WOW64_CONTEXT` 喂给 `StackWalk64` 回溯 32 位栈（用例 4.16–4.18）；崩溃停时用
+  真实 32 位上下文（rip/寄存器/bt 与 VS 一致），崩溃后读内存不再死锁（用例 4.33）
+- [x] **断点命令列表**（已实现，handover8）：`commands <id>` / `silent` / `end`，命中自动
+  执行命令、内嵌 `continue` 续跑（用例 4.32）
 - [ ] **AI 接口增强**：`--host/--port` 长驻 socket 协议（一次会话多命令，免每次
   启动进程）；JSON 结构化增强（dump/x 字节数组、断点字段补全）
-- [ ] **引擎稳定与边界**：WOW64 下 `info locals`/`thread` 的 32 位展开验证
-  （`bt` 已完成——x86 布局上下文喂 StackWalk64，用例 4.16/4.18）；
-  `list` 支持非 ASCII 源文件路径（宽字符打开）；`set scheduler-locking on|off`
-- [ ] **断点高级**：`commands <id>` 断点命令列表（自动 continue 等）；
-  `until` / `advance <loc>` 运行到指定位置
+- [ ] **引擎边界**：`list` 支持非 ASCII 源文件路径（宽字符打开）；
+  `set scheduler-locking on|off`
+- [ ] `until` / `advance <loc>` 运行到指定位置
 
 ## 文档
 
@@ -273,7 +276,8 @@ tests\run_tests.cmd        :: 全绿返回 0，可接入 CI
 ## 已知边界
 
 - `print`/`condition`/`set` 支持局部变量与表达式（handover7）；**数组下标 /
-  成员访问 / `&` 取址暂不支持**（求值器按值计算，用 `print *ptr` 解引用替代）。
+  成员访问暂不支持**（求值器按值计算，用 `print *ptr` 解引用替代）。一元 `&`（取址）
+  已支持。
 - `print` 支持 `$reg`/字面量/`*addr`/全局符号（数据打印值、函数打印地址）。
 - `disas`/`x`/`set`/`print` 支持 PDB 符号（`parse_addr` 符号回退，handover6）；
   `break`/`list`/`hbreak`/`watch`/`mbreak`/`condition` 亦支持。

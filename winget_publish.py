@@ -316,6 +316,32 @@ def pr_body(tag):
 """ % (tag, REPO, tag)
 
 
+def close_stale_prs(token, version):
+    """Close open winget PRs for this package whose version is not `version`.
+
+    winget-pkgs requires a single pending version per package; when a new
+    release supersedes an older one that is still queued for moderator
+    approval, that older PR must be closed or it blocks validation. The
+    version is parsed from the PR title ("New version: linsmod.aidbg version
+    X.Y.Z").
+    """
+    import re
+    pulls = api(token, "GET",
+                "/search/issues?q=repo:%s+is:pr+is:open+in:title+%s"
+                % (UPSTREAM, PACKAGE_ID))
+    for item in pulls.get("items", []):
+        title = item.get("title", "")
+        m = re.search(r"version\s+([\d.]+)", title)
+        if not m or m.group(1) == version:
+            continue
+        log("closing superseded PR #%d (%s) ..." % (item["number"], title))
+        api(token, "PATCH", "/repos/%s/issues/%d"
+            % (UPSTREAM, item["number"]),
+            {"state": "closed",
+             "state_reason": "not_planned"})
+        log("closed PR #%d" % item["number"])
+
+
 def open_or_find_pr(token, fork_owner, branch, title, body):
     pulls = api(token, "GET",
                 "/repos/%s/pulls?state=open&head=%s:%s&per_page=10"
@@ -395,6 +421,10 @@ def main():
     if args.no_pr:
         log("branch pushed; PR not opened (--no-pr)")
         return 0
+
+    # winget-pkgs allows one pending version per package: close any older
+    # open PR for this package before (re)opening the current one.
+    close_stale_prs(token, version)
 
     url = open_or_find_pr(
         token, fork_owner, branch,

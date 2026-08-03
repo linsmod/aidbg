@@ -117,7 +117,7 @@ submodule on the official `x64dbg` branch at `ccac889`, same as x64dbg; the repo
 commits prebuilt DLLs.
 
 ```cmd
-git clone --recurse-submodules https://github.com/linsmod/-vc-dev-debuging-tool-for-ai-agent aidbg
+git clone --recurse-submodules https://github.com/linsmod/aidbg aidbg
 cd aidbg
 cmake -S . -B build -A x64
 cmake --build build --config Release

@@ -40,7 +40,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 BUILD_BIN = os.path.join(HERE, "build", "bin")
 CMAKELISTS = os.path.join(HERE, "CMakeLists.txt")
-REPO = "linsmod/-vc-dev-debuging-tool-for-ai-agent"
+REPO = "linsmod/aidbg"
 TAG_RE = re.compile(r"^v?\d+\.\d+\.\d+$")
 
 

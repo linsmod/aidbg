@@ -109,7 +109,7 @@ aidbg.exe --command "bt" target.exe
 Git submodule 固定在官方 `x64dbg` 分支的 `ccac889`；仓库不再提交预编译 DLL。
 
 ```cmd
-git clone --recurse-submodules https://github.com/linsmod/-vc-dev-debuging-tool-for-ai-agent aidbg
+git clone --recurse-submodules https://github.com/linsmod/aidbg aidbg
 cd aidbg
 cmake -S . -B build -A x64
 cmake --build build --config Release

@@ -33,7 +33,7 @@ import tempfile
 import urllib.error
 import urllib.request
 
-REPO = "linsmod/-vc-dev-debuging-tool-for-ai-agent"
+REPO = "linsmod/aidbg"
 HERE = os.path.dirname(os.path.abspath(__file__))
 X64_ASSET_RE = re.compile(r"^aidbg-x64-.*\.zip$")
 

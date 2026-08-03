@@ -5,7 +5,7 @@ $ErrorActionPreference = 'Stop'
 # (.github/workflows/publish.yml); this script is a fallback so the package can
 # be updated with the standard `au` module too.
 
-$repo = 'linsmod/-vc-dev-debuging-tool-for-ai-agent'
+$repo = 'linsmod/aidbg'
 $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/latest"
 
 $version = $release.tag_name -replace '^v', ''

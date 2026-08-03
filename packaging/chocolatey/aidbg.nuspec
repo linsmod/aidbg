@@ -27,14 +27,14 @@ for AI coding assistants, CI automation and scripted debugging.
 - Deep PDB symbol support with source/PDB checksum validation
 - Exception interception, multi-thread support, attach/detach
 
-This is version $version$. See https://github.com/linsmod/-vc-dev-debuging-tool-for-ai-agent
+This is version $version$. See https://github.com/linsmod/aidbg
 for full usage and documentation.
 ]]></description>
-    <projectUrl>https://github.com/linsmod/-vc-dev-debuging-tool-for-ai-agent</projectUrl>
-    <projectSourceUrl>https://github.com/linsmod/-vc-dev-debuging-tool-for-ai-agent</projectSourceUrl>
-    <packageSourceUrl>https://github.com/linsmod/-vc-dev-debuging-tool-for-ai-agent</packageSourceUrl>
-    <docsUrl>https://github.com/linsmod/-vc-dev-debuging-tool-for-ai-agent/blob/master/README.md</docsUrl>
-    <releaseNotes>See https://github.com/linsmod/-vc-dev-debuging-tool-for-ai-agent/releases</releaseNotes>
+    <projectUrl>https://github.com/linsmod/aidbg</projectUrl>
+    <projectSourceUrl>https://github.com/linsmod/aidbg</projectSourceUrl>
+    <packageSourceUrl>https://github.com/linsmod/aidbg</packageSourceUrl>
+    <docsUrl>https://github.com/linsmod/aidbg/blob/master/README.md</docsUrl>
+    <releaseNotes>See https://github.com/linsmod/aidbg/releases</releaseNotes>
     <licenseUrl>https://www.gnu.org/licenses/lgpl-3.0.html</licenseUrl>
     <requireLicenseAcceptance>false</requireLicenseAcceptance>
     <tags>debugger gdb windows cli ai automation json titanengine</tags>

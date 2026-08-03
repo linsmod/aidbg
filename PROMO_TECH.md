@@ -1,6 +1,6 @@
 # linux有gdb，windows却没有一个像样的适合ai工具的命令行调试工具。如何让ai在windows上愉快的开发调试win32程序呢？aidbg 完全可以是你新的选择！
 
-> **项目地址：** https://github.com/linsmod/-vc-dev-debuging-tool-for-ai-agent.git
+> **项目地址：** https://github.com/linsmod/aidbg.git
 
 ## 问题背景
 

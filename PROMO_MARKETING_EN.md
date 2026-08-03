@@ -1,6 +1,6 @@
 # Linux has gdb. Windows has no decent command-line debugger suited for AI tools. How do you get AI to happily develop and debug Win32 programs on Windows? aidbg can be your new choice!
 
-> **Project URL:** https://github.com/linsmod/-vc-dev-debuging-tool-for-ai-agent.git
+> **Project URL:** https://github.com/linsmod/aidbg.git
 
 ## Why do AI developers on Windows always end up fighting their debugger?
 

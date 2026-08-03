@@ -41,7 +41,7 @@ import time
 import urllib.error
 import urllib.request
 
-REPO = "linsmod/-vc-dev-debuging-tool-for-ai-agent"
+REPO = "linsmod/aidbg"
 UPSTREAM = "microsoft/winget-pkgs"
 PACKAGE_ID = "linsmod.aidbg"
 MANIFEST_VERSION = "1.6.0"

@@ -1,12 +1,19 @@
-# Case 4.31 - examine string formats: x/s (8-bit), x/hs (UTF-16), x/ws (UTF-32)
+# Case 4.31 - examine strings and local-variable addresses (handover8)
 # Target: test_string.exe
 # GDB: 's' prints NUL-terminated string(s); the unit size selects the char
 # width (default b; h = 16-bit, w = 32-bit). `x/s` on a wide string stops at
 # the first NUL high byte (shows "H"), which is why `x/hs` is needed for
-# UTF-16 strings. Symbols resolve to fixed addresses (/DYNAMICBASE:NO).
+# UTF-16 strings. `x`/`dump` resolve a local (e.g. pointer param `pw`) to its
+# VALUE as the address (GDB treats the expression value as the address).
+# Symbols resolve to fixed addresses (/DYNAMICBASE:NO).
 file test_string.exe
 start
+break show
+continue
 x/s g_ascii
 x/hs g_wide
+print pw
+x/hs pw
+dump pw 24
 x/s g_wide
 quit

@@ -785,9 +785,10 @@ CASES = [
     },
     {
         "id": "4.31",
-        "name": "examine strings: x/s ascii, x/hs UTF-16",
+        "name": "examine strings + local-var addresses (x/s, x/hs)",
         "script": "case_4_31_strings.txt",
-        "expect": ["\"Hello, aidbg!\"", "\"Hello, wide aidbg!\"", ": \"H\""],
+        "expect": ["\"Hello, aidbg!\"", "\"Hello, wide aidbg!\"",
+                   "48 00 65 00 6c 00", ": \"H\""],
     },
 ]
 

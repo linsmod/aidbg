@@ -91,7 +91,7 @@ cl /nologo /Zi /Od /Oy- /GS- /MTd /Fe:<target>.exe <target>.c /link /DEBUG:FULL 
 | 4.29 | `case_4_29_frame.txt` | `frame N` 帧导航 + 按帧 `info locals` | `frame 1`→level1 的 `local_x2=6`；`frame 2`→main 的 `v` |
 | 4.30 | `case_4_30_addr_expr.txt` | 地址表达式 + GDB `x/Nfu` 格式（handover8） | `print &g_vtick`→`0x14011a280`；`x/8h`→半字值 `0x8348 0x38ec`；`u/d/t/o/c` 格式（`33608`、`-31928`、二进制、八进制、`72 'H'`）；`x/-2h` 反向查看；`x/4i`→反汇编 `SUB RSP`；坏寄存器→`error: bad address`（exit 1） |
 | 4.30b | （运行器动态驱动） | `&` 取址往返 + `$reg±offset` 转储地址 | 解析输出地址验证 `*(&local_sum)==local_sum`、`$rsp-0x10`/`$rsp+0x10` 恰好偏移 0x10、`x/Nh` 输出单位值而非反汇编 |
-| 4.31 | `case_4_31_strings.txt` | `x/s` / `x/hs` 字符串格式 | `x/s g_ascii`→`"Hello, aidbg!"`；`x/hs g_wide`→`"Hello, wide aidbg!"`；`x/s` 读宽字符串只到首个 NUL 高字节（`"H"`），故 UTF-16 需 `x/hs` |
+| 4.31 | `case_4_31_strings.txt` | `x/s` / `x/hs` 字符串 + 局部变量地址 | `x/s g_ascii`→`"Hello, aidbg!"`；`x/hs g_wide`→`"Hello, wide aidbg!"`；`x/s` 读宽字符串只到首个 NUL 高字节（`"H"`）；`x/hs pw`/`dump pw 24` 用局部指针参数的值作地址（GDB 语义） |
 
 > **断点编号**：`start` 的一次性入口断点占用 id 1（GDB 一致），因此 4.2/4.2b 的
 > `break func1` 为 id 2、4.9 的 `break add` 为 id 2，脚本与断言均已按此编号。

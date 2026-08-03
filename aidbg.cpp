@@ -1954,7 +1954,15 @@ static bool parse_addr(const std::string& tok, ULONG_PTR& out)
             if (pos == t.size()) return true;
         } catch (...) {}
     }
-    // bare identifier: fall back to PDB symbol lookup (needs symbols loaded)
+    // bare identifier: a frame-local variable first (GDB resolves a local in
+    // the current frame and uses its VALUE as the address, so `x pch` examines
+    // the memory a pointer local points to), then a PDB symbol.
+    CONTEXT c;
+    unsigned long long lv = 0; ULONG_PTR la = 0; DWORD lsz = 0;
+    if (ctx_display(c) && local_lookup(t, c, target_is64(), lv, la, lsz)) {
+        out = (ULONG_PTR)lv;
+        return true;
+    }
     return sym_lookup(t, out);
 }
 
@@ -3033,21 +3041,10 @@ static CmdResult cmd_set(const std::vector<std::string>& args)
     if (regname.size() > 1 && regname[0] == '$') regname = regname.substr(1);
     DWORD idx = reg_index_for_name(regname, is64);
     if (!idx) {
-        // not a register: bare memory address (module!off, 0x..., symbol) or a
-        // local variable of the current frame
-        ULONG_PTR a = 0;
-        if (parse_addr(left, a)) {
-            unsigned long long val = 0;
-            if (!eval_expr(right, val)) return {false, "bad value"};
-            SIZE_T n = 8;
-            if (val <= 0xFF) n = 1; else if (val <= 0xFFFF) n = 2; else if (val <= 0xFFFFFFFF) n = 4;
-            SIZE_T nw = 0;
-            if (!mem_write(a, &val, n, &nw)) return {false, "MemoryWriteSafe failed"};
-            CmdResult cr;
-            cr.js = "{\"address\":\"" + hex(a) + "\",\"value\":\"" + hex((ULONG_PTR)val) + "\",\"size\":" + std::to_string(n) + "}";
-            cr.text = "Wrote " + hex((ULONG_PTR)val) + " (" + std::to_string(n) + " bytes) to " + hex(a);
-            return cr;
-        }
+        // not a register: a local variable of the current frame (write to its
+        // stack slot, GDB lvalue semantics) or a bare memory address
+        // (module!off, 0x..., symbol).  Locals come first because parse_addr
+        // resolves a local to its VALUE (as `x`/`dump` need it as an address).
         CONTEXT c;
         unsigned long long lv = 0; ULONG_PTR la = 0; DWORD lsz = 0;
         if (ctx_display(c) && local_lookup(left, c, is64, lv, la, lsz) && la && lsz) {
@@ -3059,6 +3056,19 @@ static CmdResult cmd_set(const std::vector<std::string>& args)
             CmdResult cr;
             cr.js = "{\"variable\":\"" + js_str(left) + "\",\"value\":\"" + hex((ULONG_PTR)val) + "\"}";
             cr.text = "Wrote " + hex((ULONG_PTR)val) + " to " + left;
+            return cr;
+        }
+        ULONG_PTR a = 0;
+        if (parse_addr(left, a)) {
+            unsigned long long val = 0;
+            if (!eval_expr(right, val)) return {false, "bad value"};
+            SIZE_T n = 8;
+            if (val <= 0xFF) n = 1; else if (val <= 0xFFFF) n = 2; else if (val <= 0xFFFFFFFF) n = 4;
+            SIZE_T nw = 0;
+            if (!mem_write(a, &val, n, &nw)) return {false, "MemoryWriteSafe failed"};
+            CmdResult cr;
+            cr.js = "{\"address\":\"" + hex(a) + "\",\"value\":\"" + hex((ULONG_PTR)val) + "\",\"size\":" + std::to_string(n) + "}";
+            cr.text = "Wrote " + hex((ULONG_PTR)val) + " (" + std::to_string(n) + " bytes) to " + hex(a);
             return cr;
         }
         return {false, "cannot resolve: " + left};
@@ -3210,7 +3220,8 @@ static CmdResult cmd_dump(const std::vector<std::string>& args)
 {
     if (!require_running()) return {false, "no active debug session"};
     ULONG_PTR addr = 0;
-    if (args.empty() || !parse_addr(args[0], addr)) return {false, "usage: dump <addr> [size]"};
+    if (args.empty()) return {false, "usage: dump <addr> [size]"};
+    if (!parse_addr(args[0], addr)) return {false, "bad address: " + args[0]};
     size_t n = args.size() > 1 ? (size_t)strtoull(args[1].c_str(), nullptr, 0) : 256;
     if (n > 65536) n = 65536;
     std::vector<unsigned char> buf(n);

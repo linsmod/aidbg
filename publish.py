@@ -207,10 +207,10 @@ def main():
     if not args.skip_choco:
         steps.append((
             "choco",
-            "python publish_chocolatey.py %s" % version,
+            "python publish_chocolatey.py %s" % tag,
             lambda: run(["python",
                          os.path.join(HERE, "publish_chocolatey.py"),
-                         version]),
+                         tag]),
         ))
 
     if args.dry_run:

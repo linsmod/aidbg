@@ -540,6 +540,44 @@ def case_bp_commands():
     return results
 
 
+def case_wow64_crash_bt():
+    """Case 4.33 - WoW64 crash stop: clean 32-bit backtrace + no memory-read deadlock.
+
+    A 32-bit null function-pointer call surfaces the 0xc0000005 through the
+    64-bit WoW64 transition code, so the raw context is 64-bit (RIP in ntdll64).
+    aidbg must present the real 32-bit state: rip = 0 (the faulting EIP), a bt
+    that resolves the 32-bit callers (no truncated-thunk garbage), and memory
+    reads that do not deadlock on TitanEngine's breakpoint lock.
+    """
+    results = []
+    script = os.path.join(HERE, "_case_4_33_wowcrash.txt")
+    lines = [
+        "file test_wow64.exe",
+        "set args crash",
+        "run",
+        "dump 0x400000 16",
+        "bt",
+        "quit",
+    ]
+    with open(script, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    try:
+        rc, out = aidbg_run(script)
+    finally:
+        if os.path.exists(script):
+            os.unlink(script)
+    results.append(("exception stop with EIP=0 (32-bit context)",
+                    "Stopped: exception" in out and
+                    "rip = 0x0000000000000000" in out, out))
+    results.append(("memory read works after the crash (no deadlock)",
+                    "4d 5a 90 00" in out, out))
+    results.append(("bt resolves the 32-bit callers",
+                    "wow_crash" in out and "main" in out, out))
+    results.append(("bt has no unwinder-garbage frames",
+                    " in ??" not in out, out))
+    return results
+
+
 def case_batch_compat():
     """Case 4.22 - GDB invocation compatibility (gdb_quick_reference.txt OPTIONS).
 
@@ -835,6 +873,13 @@ CASES = [
         "expect": None,
         "dynamic": "bpcmds",
     },
+    {
+        "id": "4.33",
+        "name": "WoW64 crash: clean bt + no memory-read deadlock",
+        "script": None,
+        "expect": None,
+        "dynamic": "wowcrashbt",
+    },
 ]
 
 
@@ -888,6 +933,8 @@ def main():
             results = case_addr_expr()
         elif case.get("dynamic") == "bpcmds":
             results = case_bp_commands()
+        elif case.get("dynamic") == "wowcrashbt":
+            results = case_wow64_crash_bt()
         else:
             results = run_case(case)
         all_cases.append((case["id"], case["name"], results, case.get("xfail")))

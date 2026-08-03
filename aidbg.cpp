@@ -795,6 +795,53 @@ static bool ctx_fetch(DWORD tid, CONTEXT& out)
     return ok;
 }
 
+static bool wow64_effective_ctx(CONTEXT& out);
+
+// current instruction pointer of the stop, preferring the real 32-bit context
+// for a WoW64 target stopped in 64-bit transition code
+static ULONG_PTR effective_pc()
+{
+    CONTEXT c;
+    if (wow64_effective_ctx(c)) return c.Rip;
+    return reg_get(UE_CIP);
+}
+
+// For a WoW64 (32-bit) target, an exception that surfaces through the 64-bit
+// WoW64 transition code (e.g. a 32-bit indirect call through a null pointer)
+// reports a native 64-bit thread context (RIP inside ntdll64's Wow64AllocateTemp).
+// The real faulting state is the thread's 32-bit context; fetch it with
+// WOW64GetThreadContext and pack it into the AMD64-layout CONTEXT low dwords so
+// EIP/ESP/EBP and the 32-bit stack walk match the faulting code (like VS/WinDbg).
+static bool wow64_effective_ctx(CONTEXT& out)
+{
+    if (target_is64()) return false;
+    if (g_reason == "initial-break") return false;   // native 64-bit ntdll init, no 32-bit state yet
+    ULONG_PTR pc = GetContextData(UE_CIP);
+    if (pc < 0x100000000ULL) return false;           // already a 32-bit (native) stop
+    DWORD tid = ctx_event_tid();
+    if (!tid) return false;
+    HANDLE th = OpenThread(THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, tid);
+    if (!th) return false;
+    WOW64_CONTEXT wc = {};
+    wc.ContextFlags = CONTEXT_ALL;
+    // WOW64GetThreadContext may not be declared by every SDK header; resolve it
+    // at runtime (it has been in kernel32 since Vista).
+    static auto fn = (BOOL(WINAPI*)(HANDLE, PWOW64_CONTEXT))
+        GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "Wow64GetThreadContext");
+    BOOL ok = fn ? fn(th, &wc) : FALSE;
+    CloseHandle(th);
+    if (!ok) return false;
+    if (wc.Eip >= 0x100000000ULL) return false;      // unexpectedly still 64-bit
+    out = CONTEXT{};
+    out.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS;
+    out.Rax = wc.Eax; out.Rbx = wc.Ebx; out.Rcx = wc.Ecx; out.Rdx = wc.Edx;
+    out.Rdi = wc.Edi; out.Rsi = wc.Esi; out.Rbp = wc.Ebp; out.Rsp = wc.Esp; out.Rip = wc.Eip;
+    out.EFlags = wc.EFlags;
+    out.SegGs = (WORD)wc.SegGs; out.SegFs = (WORD)wc.SegFs; out.SegEs = (WORD)wc.SegEs;
+    out.SegDs = (WORD)wc.SegDs; out.SegCs = (WORD)wc.SegCs; out.SegSs = (WORD)wc.SegSs;
+    return true;
+}
+
 // build a CONTEXT from TitanEngine's cached context for the current event thread
 // (we always compile for x64, so the CONTEXT is the AMD64 layout; 32-bit target
 //  register names fall back to reg_get in ctx_reg below)
@@ -822,6 +869,9 @@ static CONTEXT ctx_from_titan()
         if (!c.SegFs) c.SegFs = 0x53;
         if (!c.SegGs) c.SegGs = 0x2B;
     }
+    // WoW64: prefer the real 32-bit context when stopped in 64-bit transition code
+    CONTEXT wow;
+    if (wow64_effective_ctx(wow)) return wow;
     return c;
 }
 
@@ -971,7 +1021,7 @@ static std::string stop_banner(const std::string& reason)
     o << "Stopped: " << reason << "  [thread " << thread << "]\n";
     if (reason == "exception")
         o << "  exception 0x" << std::hex << g_exception_code << " at " << hex(g_exception_addr) << std::dec << "\n";
-    o << "  rip = " << hex(reg_get(UE_CIP)) << "  (" << resolve(reg_get(UE_CIP)) << ")\n";
+    o << "  rip = " << hex(effective_pc()) << "  (" << resolve(effective_pc()) << ")\n";
     return o.str();
 }
 
@@ -3397,9 +3447,18 @@ static bool bt_walk(int max, std::vector<ULONG_PTR>& addrs)
     CONTEXT base;
     if (!ctx_display_base(base)) return false;
 
-    // frame 0 = the live top frame (context, pc)
+    // frame 0 = the live top frame. For a WoW64 stop in 64-bit transition code
+    // (a crash surfaced through the thunk), seed the i386 walk from the reported
+    // 32-bit EIP so StackWalk64 can start; the module filter below drops the
+    // truncated-thunk frames it guesses, keeping the real callers.
     ULONG_PTR base_pc = is64 ? base.Rip : reg_get(UE_EIP);
-    {
+    // For a WoW64 stop, drop frames whose pc is not inside any loaded module: a
+    // crash in 64-bit transition code surfaces EIP=0 plus truncated-thunk frames
+    // that the i386 unwinder guesses, not real callers (the real chain resolves).
+    auto keep_frame = [&](ULONG_PTR pc) {
+        return is64 || !module_name_for(pc).empty();
+    };
+    if (keep_frame(base_pc)) {
         FrameInfo f0; f0.ctx = base; f0.pc = base_pc; f0.frameBase = 0;
         if (is64) { CONTEXT cc = base; frame_base_rsp(cc, true, f0.frameBase); }
         g_frames.push_back(f0);
@@ -3442,6 +3501,7 @@ static bool bt_walk(int max, std::vector<ULONG_PTR>& addrs)
             first = false;
             if (pc == base_pc) continue;
         }
+        if (!keep_frame(pc)) continue;
         if (seen.count(pc)) break;   // unwinder loop guard
         seen.insert(pc);
         FrameInfo fi; fi.pc = pc; fi.frameBase = 0;

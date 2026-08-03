@@ -11,6 +11,7 @@
 
 #include <windows.h>
 #include <stdio.h>
+#include <string.h>
 
 volatile int g_wow_index = 0;
 
@@ -22,9 +23,20 @@ __declspec(noinline) int wow_target(int x)
     return local;
 }
 
+// null function-pointer call: crashes with 0xc0000005 "execute at 0x00000000".
+// Under WoW64 the exception surfaces in 64-bit transition code; the bt must
+// recover the 32-bit callers and memory reads must not deadlock (case 4.33).
+__declspec(noinline) int wow_crash(void)
+{
+    void (*p)(void) = 0;
+    p();
+    return 0;
+}
+
 int main(int argc, char** argv)
 {
     printf("Hello, wow64!\n");
+    if (argc > 1 && strcmp(argv[1], "crash") == 0) return wow_crash();
     for (int i = 0; i < 3; i++)
         wow_target(i);
     printf("done, g_wow_index=%d\n", g_wow_index);

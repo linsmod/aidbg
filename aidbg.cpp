@@ -47,6 +47,8 @@
 #include <bcrypt.h>
 #pragma comment(lib, "bcrypt.lib")
 
+#include <distorm.h>
+
 #include <string>
 #include <vector>
 #include <map>
@@ -303,6 +305,11 @@ struct CmdResult;
 static CmdResult cmd_info_vars(bool args_only);
 
 static bool mem_read(ULONG_PTR addr, void* buf, SIZE_T n, SIZE_T* nr);
+static bool raw_read(ULONG_PTR addr, void* buf, SIZE_T n, SIZE_T* nr);
+static bool disasm_one(ULONG_PTR addr, const unsigned char* buf, size_t buflen,
+                       bool is64, std::string& text, int& len);
+static void orig_set(ULONG_PTR addr, unsigned char b);
+static void orig_del(ULONG_PTR addr);
 static bool sym_lookup(const std::string& name, ULONG_PTR& out);
 static bool eval_cond(const std::string& expr, bool& out);
 static void apply_pending_bps();
@@ -519,9 +526,8 @@ static void __cdecl cb_exception_stop(void*)
             g_hit_bp_id = 0;
             PROCESS_INFORMATION* pi = TitanGetProcessInformation();
             unsigned char opcode = 0;
-            is_int3 = pi && MemoryReadSafe(pi->hProcess,
-                                           (void*)g_exception_addr,
-                                           &opcode, sizeof(opcode), nullptr) &&
+            is_int3 = pi && raw_read((ULONG_PTR)g_exception_addr,
+                                     &opcode, sizeof(opcode), nullptr) &&
                       opcode == 0xCC;
         }
 
@@ -573,7 +579,7 @@ static bool bp_hit(ULONG_PTR addr, int kind)
             g_hit_bp_oneshot = b->oneshot;
             if (b->oneshot) {
                 // GDB tbreak: remove after the first hit
-                if (b->kind == 0 && b->addr) DeleteBPX(b->addr);
+                if (b->kind == 0 && b->addr) { DeleteBPX(b->addr); orig_del(b->addr); }
                 else if (b->kind == 1) DeleteAPIBreakPoint(b->dll.c_str(), b->api.c_str(), UE_APISTART);
                 else if (b->kind == 2) DeleteHardwareBreakPoint(b->hwreg);
                 else if (b->kind == 3) RemoveMemoryBPX(b->addr, b->memsize);
@@ -622,7 +628,7 @@ static void __cdecl cb_step_bp()
         addr = g_step_bp_addr;
         g_step_bp_addr = 0;
     }
-    if (addr) DeleteBPX(addr);
+    if (addr) { DeleteBPX(addr); orig_del(addr); }
     pause_until_continue("step-bp");
 }
 
@@ -1064,19 +1070,135 @@ static int bp_last_id()
 }
 
 // ------------------------------------------------------------------ memory ---
+//
+// aidbg reads/writes the target memory itself instead of TitanEngine's
+// MemoryReadSafe / MemoryWriteSafe. Those helpers take the engine's
+// LockBreakPointBuffer (inside BreakPointPostReadFilter / BreakPointPreWriteFilter),
+// which is held by the DebugLoop thread while it is paused in the
+// AV/GUARD_PAGE handler callback — calling them from the REPL thread at that
+// point deadlocks (x64dbg/TitanEngine#39). The lock must stay in the engine
+// (it protects the memory-breakpoint transaction), so aidbg avoids re-entering
+// it from the REPL side.
+//
+// The only behavior lost vs MemoryReadSafe is that software-breakpoint bytes
+// are restored from aidbg's own bookkeeping (g_origbytes) instead of the
+// engine's breakpoint buffer; guard-page reads are still retried below.
 
-static bool mem_read(ULONG_PTR addr, void* buf, SIZE_T n, SIZE_T* nr)
+// Original bytes at aidbg software-breakpoint addresses (set at breakpoint
+// arming time, before the engine patches 0xCC). Guarded by its own mutex so
+// mem_read never touches g_bp_mu (bp_hit -> eval_cond -> mem_read already runs
+// with g_bp_mu held).
+static std::mutex g_orig_mu;
+static std::map<ULONG_PTR, unsigned char> g_origbytes;
+
+static void orig_set(ULONG_PTR addr, unsigned char b)
+{
+    std::lock_guard<std::mutex> lk(g_orig_mu);
+    g_origbytes[addr] = b;
+}
+static void orig_del(ULONG_PTR addr)
+{
+    std::lock_guard<std::mutex> lk(g_orig_mu);
+    g_origbytes.erase(addr);
+}
+
+// Capture the original byte at `addr` (must be called BEFORE SetBPX patches
+// 0xCC in). Falls back to 0 when the target can't be read.
+static unsigned char capture_orig_byte(ULONG_PTR addr)
+{
+    PROCESS_INFORMATION* pi = TitanGetProcessInformation();
+    unsigned char b = 0; SIZE_T nr = 0;
+    if (pi && pi->hProcess && ReadProcessMemory(pi->hProcess, (void*)addr, &b, 1, &nr) && nr == 1)
+        return b;
+    return 0;
+}
+
+// Restore the original bytes where aidbg's software breakpoints are patched,
+// mirroring TitanEngine's BreakPointPostReadFilter without the engine lock.
+static void restore_orig_bytes(unsigned char* buf, ULONG_PTR base, SIZE_T n)
+{
+    std::lock_guard<std::mutex> lk(g_orig_mu);
+    for (auto& kv : g_origbytes) {
+        if (kv.first >= base && kv.first < base + n)
+            buf[kv.first - base] = kv.second;
+    }
+}
+
+// Raw read with a guard-page fallback (mirrors MemoryReadSafe's retry, minus
+// the engine's locks, so it can never deadlock the debug loop).
+static bool raw_read(ULONG_PTR addr, void* buf, SIZE_T n, SIZE_T* nr)
 {
     PROCESS_INFORMATION* pi = TitanGetProcessInformation();
     if (!pi || !pi->hProcess) return false;
-    return MemoryReadSafe(pi->hProcess, (void*)addr, buf, n, nr) != FALSE;
+    SIZE_T got = 0;
+    if (ReadProcessMemory(pi->hProcess, (void*)addr, buf, n, &got)) {
+        if (nr) *nr = got;
+        return true;
+    }
+    std::vector<MEMORY_BASIC_INFORMATION> memRegions;
+    MEMORY_BASIC_INFORMATION memInfo = {};
+    ULONG_PTR endAddr = addr + n;
+    for (ULONG_PTR page = addr & ~(ULONG_PTR)0xFFF; page < endAddr; page += memInfo.RegionSize) {
+        if (0 == VirtualQueryEx(pi->hProcess, (LPCVOID)page, &memInfo, sizeof(memInfo))) break;
+        memRegions.push_back(memInfo);
+    }
+    DWORD dwProtect = 0;
+    if (!VirtualProtectEx(pi->hProcess, (void*)addr, n, PAGE_EXECUTE_READ, &dwProtect))
+        return false;
+    BOOL ok = ReadProcessMemory(pi->hProcess, (void*)addr, buf, n, &got);
+    for (const auto& info : memRegions) {
+        ULONG_PTR size = info.RegionSize;
+        if (endAddr < (ULONG_PTR)info.BaseAddress + info.RegionSize)
+            size = endAddr - (ULONG_PTR)info.BaseAddress;
+        VirtualProtectEx(pi->hProcess, info.BaseAddress, size, info.Protect, &dwProtect);
+    }
+    if (!ok) return false;
+    if (nr) *nr = got;
+    return true;
 }
 
+// Lock-free memory read: never enters the engine's breakpoint lock.
+static bool mem_read(ULONG_PTR addr, void* buf, SIZE_T n, SIZE_T* nr)
+{
+    SIZE_T got = 0;
+    if (!raw_read(addr, buf, n, &got)) return false;
+    if (nr) *nr = got;
+    restore_orig_bytes((unsigned char*)buf, addr, got);
+    return true;
+}
+
+// Lock-free memory write: disables overlapping software breakpoints, writes,
+// then re-arms them (mirrors MemoryWriteSafe without the engine lock).
 static bool mem_write(ULONG_PTR addr, const void* buf, SIZE_T n, SIZE_T* nw)
 {
     PROCESS_INFORMATION* pi = TitanGetProcessInformation();
     if (!pi || !pi->hProcess) return false;
-    return MemoryWriteSafe(pi->hProcess, (void*)addr, buf, n, nw) != FALSE;
+    std::vector<ULONG_PTR> touched;
+    {
+        std::lock_guard<std::mutex> lk(g_orig_mu);
+        for (auto& kv : g_origbytes)
+            if (kv.first >= addr && kv.first < addr + n) touched.push_back(kv.first);
+    }
+    for (ULONG_PTR a : touched) {
+        unsigned char ob = 0; SIZE_T w = 0;
+        { std::lock_guard<std::mutex> lk(g_orig_mu); auto it = g_origbytes.find(a); if (it != g_origbytes.end()) ob = it->second; }
+        WriteProcessMemory(pi->hProcess, (void*)a, &ob, 1, &w);
+    }
+    SIZE_T wb = 0;
+    bool ok = WriteProcessMemory(pi->hProcess, (void*)addr, buf, n, &wb) != FALSE;
+    if (!ok && n) {
+        DWORD oldProtect = 0;
+        if (VirtualProtectEx(pi->hProcess, (void*)addr, n, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+            ok = WriteProcessMemory(pi->hProcess, (void*)addr, buf, n, &wb) != FALSE;
+            VirtualProtectEx(pi->hProcess, (void*)addr, n, oldProtect, &oldProtect);
+        }
+    }
+    for (ULONG_PTR a : touched) {
+        unsigned char cc = 0xCC; SIZE_T w = 0;
+        WriteProcessMemory(pi->hProcess, (void*)a, &cc, 1, &w);
+    }
+    if (nw) *nw = wb;
+    return ok;
 }
 
 // ---------------------------------------------------------------- modules ---
@@ -1369,15 +1491,13 @@ static ULONG_PTR line_range_end(ULONG_PTR addr)
     if (!src_line(addr, f0, l0)) return 0;
     bool is64 = target_is64();
     ULONG_PTR fend = is64 ? func_end_x64(addr) : 0;
-    PROCESS_INFORMATION* pi = TitanGetProcessInformation();
-    if (!pi || !pi->hProcess) return 0;
     ULONG_PTR cur = addr;
     for (int i = 0; i < 2048; i++) {
-        long ln = LengthDisassembleEx(pi->hProcess, (void*)cur);
-        if (ln <= 0) break;
-        unsigned char op = 0; SIZE_T nr = 0;
-        if (!MemoryReadSafe(pi->hProcess, (void*)cur, &op, 1, &nr) || nr != 1) break;
-        if (op == 0xC3 || op == 0xC2) return 0;      // ret / ret imm16: single-step instead
+        unsigned char ibuf[16] = {}; SIZE_T nr = 0;
+        if (!mem_read(cur, ibuf, sizeof(ibuf), &nr) || nr < 1) break;
+        std::string t; int ln = 0;
+        if (!disasm_one(cur, ibuf, nr, is64, t, ln) || ln <= 0) break;
+        if (ibuf[0] == 0xC3 || ibuf[0] == 0xC2) return 0;   // ret / ret imm16: single-step instead
         cur += (ULONG_PTR)ln;
         if (fend && cur >= fend) break;              // walked past the function end
         std::string f; long l = 0;
@@ -1895,31 +2015,49 @@ static std::string resolve_gdb(ULONG_PTR addr)
 
 struct Insn { ULONG_PTR addr; int len; std::string text; std::string bytes; };
 
+// Decode one instruction from a locally-read buffer with distorm (the same
+// decoder the engine uses). Avoids DisassembleEx/LengthDisassembleEx, which
+// read via MemoryReadSafe and would deadlock on the engine breakpoint lock
+// while paused inside the AV handler.
+static bool disasm_one(ULONG_PTR addr, const unsigned char* buf, size_t buflen,
+                       bool is64, std::string& text, int& len)
+{
+    _DecodedInst di[1];
+    unsigned int used = 0;
+    if (distorm_decode(addr, buf, (int)buflen, is64 ? Decode64Bits : Decode32Bits,
+                       di, 1, &used) == DECRES_INPUTERR || used == 0 || di[0].size == 0)
+        return false;
+    len = (int)di[0].size;
+    // Engine text format: mnemonic + (" " if size) + operands
+    text = (const char*)di[0].mnemonic.p;
+    if (di[0].size) text += " ";
+    text += (const char*)di[0].operands.p;
+    return true;
+}
+
 static std::vector<Insn> disasm(ULONG_PTR addr, int count)
 {
     std::vector<Insn> out;
-    PROCESS_INFORMATION* pi = TitanGetProcessInformation();
-    if (!pi || !pi->hProcess) return out;
+    bool is64 = target_is64();
     ULONG_PTR a = addr;
     for (int i = 0; i < count; i++) {
-        void* s = DisassembleEx(pi->hProcess, (void*)a, false);
-        long ln = LengthDisassembleEx(pi->hProcess, (void*)a);
-        if (!s || ln <= 0) break;
+        unsigned char buf[16] = {};
+        SIZE_T nr = 0;
+        if (!mem_read(a, buf, sizeof(buf), &nr) || nr < 1) break;
+        std::string text;
+        int ln = 0;
+        if (!disasm_one(a, buf, nr, is64, text, ln)) break;
         Insn in;
         in.addr = a;
-        in.len = (int)ln;
-        in.text = (char*)s;
-        std::vector<unsigned char> bytes(ln);
-        SIZE_T nr = 0;
-        if (mem_read(a, bytes.data(), ln, &nr)) {
-            std::ostringstream o;
-            for (size_t k = 0; k < nr && k < 16; k++) {
-                char b[4]; snprintf(b,sizeof b,"%02x ", bytes[k]); o << b;
-            }
-            in.bytes = o.str();
+        in.len = ln;
+        in.text = text;
+        std::ostringstream o;
+        for (int k = 0; k < ln && k < (int)nr && k < 16; k++) {
+            char b[4]; snprintf(b,sizeof b,"%02x ", buf[k]); o << b;
         }
+        in.bytes = o.str();
         out.push_back(in);
-        a += ln;
+        a += (ULONG_PTR)ln;
     }
     return out;
 }
@@ -2402,8 +2540,10 @@ static CmdResult cmd_run(const std::vector<std::string>& args, const std::string
             return {false, "No symbol \"" + (want.empty() ? std::string("main") : want)
                            + "\" in current context. (start: entry symbol not found)"};
         }
+        unsigned char orig = capture_orig_byte(entry);
         if (!SetBPX(entry, UE_BREAKPOINT | UE_BREAKPOINT_TYPE_INT3, (void*)&cb_bpx))
             return {false, "SetBPX failed for entry symbol"};
+        orig_set(entry, orig);
         Bpx b; b.id = g_bp_next_id++; b.kind = 0; b.addr = entry; b.enabled = true;
         b.symbol = want.empty() ? "main" : want; b.oneshot = true;
         g_bps[b.id] = b;
@@ -2559,17 +2699,15 @@ static CmdResult cmd_step(const char* kind, int n)
 // read the return address pushed by the current call frame (from the stack top)
 static ULONG_PTR read_stack_return(bool is64)
 {
-    PROCESS_INFORMATION* pi = TitanGetProcessInformation();
-    if (!pi || !pi->hProcess) return 0;
     ULONG_PTR sp = reg_get(UE_CSP);
     if (!sp) return 0;
     if (is64) {
         ULONG_PTR ret = 0; SIZE_T nr = 0;
-        if (!MemoryReadSafe(pi->hProcess, (void*)sp, &ret, sizeof(ret), &nr) || nr != sizeof(ret)) return 0;
+        if (!mem_read(sp, &ret, sizeof(ret), &nr) || nr != sizeof(ret)) return 0;
         return ret;
     }
     DWORD ret = 0; SIZE_T nr = 0;
-    if (!MemoryReadSafe(pi->hProcess, (void*)sp, &ret, sizeof(ret), &nr) || nr != sizeof(ret)) return 0;
+    if (!mem_read(sp, &ret, sizeof(ret), &nr) || nr != sizeof(ret)) return 0;
     return (ULONG_PTR)ret;
 }
 
@@ -2579,7 +2717,7 @@ static void clear_internal_bp()
     std::lock_guard<std::mutex> lk(g_bp_mu);
     ULONG_PTR addr = g_step_bp_addr;
     g_step_bp_addr = 0;
-    if (addr) DeleteBPX(addr);
+    if (addr) { DeleteBPX(addr); orig_del(addr); }
 }
 
 // arm the internal one-shot breakpoint at `addr` and run; returns the stop reason
@@ -2587,10 +2725,11 @@ static std::string run_to_internal_bp(ULONG_PTR addr)
 {
     {
         std::lock_guard<std::mutex> lk(g_bp_mu);
-        if (g_step_bp_addr) { ULONG_PTR old = g_step_bp_addr; g_step_bp_addr = 0; if (old) DeleteBPX(old); }
+        if (g_step_bp_addr) { ULONG_PTR old = g_step_bp_addr; g_step_bp_addr = 0; if (old) { DeleteBPX(old); orig_del(old); } }
         g_step_bp_addr = addr;
         g_step_tid = ctx_event_tid();
     }
+    unsigned char orig = capture_orig_byte(addr);
     if (!SetBPX(addr, UE_BREAKPOINT | UE_BREAKPOINT_TYPE_INT3, (void*)&cb_step_bp)) {
         std::lock_guard<std::mutex> lk(g_bp_mu);
         g_step_bp_addr = 0;
@@ -2599,6 +2738,7 @@ static std::string run_to_internal_bp(ULONG_PTR addr)
         resume_waiting_callback();
         return wait_stop_consume();
     }
+    orig_set(addr, orig);
     ctx_reset();
     resume_waiting_callback();
     return wait_stop_consume();
@@ -2746,8 +2886,10 @@ static CmdResult cmd_break(const std::vector<std::string>& args)
             }
             bool running = require_running();
             if (running) {
+                unsigned char orig = capture_orig_byte(la);
                 bool r = SetBPX(la, UE_BREAKPOINT | UE_BREAKPOINT_TYPE_INT3, (void*)&cb_bpx);
                 if (!r) return {false, "SetBPX failed"};
+                orig_set(la, orig);
             }
             Bpx b; b.id = g_bp_next_id++; b.kind = 0; b.addr = la; b.enabled = true;
             b.symbol = spec; b.file = linefile; b.line = lineno;
@@ -2786,8 +2928,10 @@ static CmdResult cmd_break(const std::vector<std::string>& args)
     if (sym_lookup(spec, addr) && addr) {
         bool running = require_running();
         if (running) {
+            unsigned char orig = capture_orig_byte(addr);
             bool r = SetBPX(addr, UE_BREAKPOINT | UE_BREAKPOINT_TYPE_INT3, (void*)&cb_bpx);
             if (!r) return {false, "SetBPX failed"};
+            orig_set(addr, orig);
         }
         Bpx b; b.id = g_bp_next_id++; b.kind = 0; b.addr = addr; b.enabled = true; b.symbol = spec;
         b.pending = !running;
@@ -2804,8 +2948,10 @@ static CmdResult cmd_break(const std::vector<std::string>& args)
         // SetBPX needs the debugged process; before `run` the breakpoint is pending
         bool running = require_running();
         if (running) {
+            unsigned char orig = capture_orig_byte(addr);
             bool r = SetBPX(addr, UE_BREAKPOINT | UE_BREAKPOINT_TYPE_INT3, (void*)&cb_bpx);
             if (!r) return {false, "SetBPX failed"};
+            orig_set(addr, orig);
         }
         Bpx b; b.id = g_bp_next_id++; b.kind = 0; b.addr = addr; b.enabled = true; b.symbol = spec;
         b.pending = !running;
@@ -2854,7 +3000,9 @@ static void apply_pending_bps()
         else if (!b.symbol.empty() && sym_lookup(b.symbol, addr)) ok = true;
         else if (b.addr) { addr = b.addr; ok = true; }
         if (!ok || !addr) continue;
+        unsigned char orig = capture_orig_byte(addr);
         if (!SetBPX(addr, UE_BREAKPOINT | UE_BREAKPOINT_TYPE_INT3, (void*)&cb_bpx)) continue;
+        orig_set(addr, orig);
         b.addr = addr;
         b.pending = false;
     }
@@ -2939,7 +3087,7 @@ static CmdResult cmd_bp_ops(const std::string& op, const std::vector<std::string
         for (auto it = g_bps.begin(); it != g_bps.end(); ) {
             Bpx& b = it->second;
             if (!b.pending) {
-                if (b.kind == 0 && b.addr) DeleteBPX(b.addr);
+                if (b.kind == 0 && b.addr) { DeleteBPX(b.addr); orig_del(b.addr); }
                 else if (b.kind == 1) DeleteAPIBreakPoint(b.dll.c_str(), b.api.c_str(), UE_APISTART);
                 else if (b.kind == 2) DeleteHardwareBreakPoint(b.hwreg);
                 else if (b.kind == 3) RemoveMemoryBPX(b.addr, b.memsize);
@@ -2975,7 +3123,7 @@ static CmdResult cmd_bp_ops(const std::string& op, const std::vector<std::string
         Bpx& b = it->second;
         if (op == "delete") {
             if (!b.pending) {
-                if (b.kind == 0 && b.addr) DeleteBPX(b.addr);
+                if (b.kind == 0 && b.addr) { DeleteBPX(b.addr); orig_del(b.addr); }
                 else if (b.kind == 1) DeleteAPIBreakPoint(b.dll.c_str(), b.api.c_str(), UE_APISTART);
                 else if (b.kind == 2) DeleteHardwareBreakPoint(b.hwreg);
                 else if (b.kind == 3) RemoveMemoryBPX(b.addr, b.memsize);

@@ -6,7 +6,7 @@ endif()
 
 cmake_policy(SET CMP0091 NEW)
 
-project(aidbg VERSION 0.1.1 LANGUAGES C CXX)
+project(aidbg VERSION 0.1.2 LANGUAGES C CXX)
 
 # ---- version metadata from git (used by aidbg.rc and the --version flag) ----
 execute_process(
@@ -62,7 +62,7 @@ target_compile_definitions(aidbg PRIVATE
     AIDBG_VERSION="${PROJECT_VERSION}"
     AIDBG_GIT_HASH="${AIDBG_GIT_HASH}"
     AIDBG_GIT_DIRTY=${AIDBG_GIT_DIRTY})
-target_link_libraries(aidbg PRIVATE TitanEngine)
+target_link_libraries(aidbg PRIVATE TitanEngine distorm)
 
 if(MSVC)
     target_compile_options(aidbg PRIVATE /utf-8)

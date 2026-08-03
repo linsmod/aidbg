@@ -92,6 +92,7 @@ cl /nologo /Zi /Od /Oy- /GS- /MTd /Fe:<target>.exe <target>.c /link /DEBUG:FULL 
 | 4.30 | `case_4_30_addr_expr.txt` | 地址表达式 + GDB `x/Nfu` 格式（handover8） | `print &g_vtick`→`0x14011a280`；`x/8h`→半字值 `0x8348 0x38ec`；`u/d/t/o/c` 格式（`33608`、`-31928`、二进制、八进制、`72 'H'`）；`x/-2h` 反向查看；`x/4i`→反汇编 `SUB RSP`；坏寄存器→`error: bad address`（exit 1） |
 | 4.30b | （运行器动态驱动） | `&` 取址往返 + `$reg±offset` 转储地址 | 解析输出地址验证 `*(&local_sum)==local_sum`、`$rsp-0x10`/`$rsp+0x10` 恰好偏移 0x10、`x/Nh` 输出单位值而非反汇编 |
 | 4.31 | `case_4_31_strings.txt` | `x/s` / `x/hs` 字符串 + 局部变量地址 | `x/s g_ascii`→`"Hello, aidbg!"`；`x/hs g_wide`→`"Hello, wide aidbg!"`；`x/s` 读宽字符串只到首个 NUL 高字节（`"H"`）；`x/hs pw`/`dump pw 24` 用局部指针参数的值作地址（GDB 语义） |
+| 4.32 | （运行器动态驱动） | 断点命令列表 `commands`/`silent`/`end` | 命中 `show` 自动执行命令：`silent` 抑制横幅（输出仅 1 处 `Stopped: breakpoint`）、`x/hs pw` 自动打印、内嵌 `continue` 续跑至退出 |
 
 > **断点编号**：`start` 的一次性入口断点占用 id 1（GDB 一致），因此 4.2/4.2b 的
 > `break func1` 为 id 2、4.9 的 `break add` 为 id 2，脚本与断言均已按此编号。
@@ -119,6 +120,9 @@ cl /nologo /Zi /Od /Oy- /GS- /MTd /Fe:<target>.exe <target>.c /link /DEBUG:FULL 
   `continue` 正常推进、`stepi` 可单步。
 - **4.22**：动态调用三次 `aidbg --batch`，断言 man page 的 OPTIONS 语义——成功脚本
   退出码 0、命令出错退出码非 0、`-e <file>`（`--exec`）选中目标并运行（退出码 42）。
+- **4.32**：断点命令列表跨多条 `-ex`/脚本行累积（`commands` 到 `end`），命中后自动
+  执行；`silent` 抑制命中横幅，命令中的 `continue` 续跑。断言输出中 `Stopped: breakpoint`
+  恰好 1 次（仅 `start` 的临时断点）、`x/hs pw` 输出出现、进程正常退出。
 - **4.30b**：栈地址每次运行不同，无法写死在脚本里，故解析单次会话输出：断言
   `print &local_sum` 得到地址 A 且 `*(&local_sum)` 低 32 位等于 `local_sum` 的值
   （`&` 取址往返）；`x/4h $rsp-0x10`/`$rsp+0x10` 的 dump 地址恰好比 `$rsp` 低/高

@@ -246,6 +246,8 @@ struct Bpx {
     std::string condition;    // stop only while this expression evaluates true
     bool oneshot = false;     // temporary breakpoint (tbreak / `start`): removed after first hit
     bool pending = false;     // symbol breakpoint set before run: applied on process start
+    std::vector<std::string> cmds;   // GDB `commands`: run automatically on each hit
+    bool silent = false;             // GDB `silent` as first command: suppress the stop banner
 };
 static std::map<int,Bpx> g_bps;
 static std::mutex g_bp_mu;               // guards g_bps (REPL vs DebugLoop thread)
@@ -254,6 +256,12 @@ static int g_hit_bp_id = 0;              // breakpoint that triggered the curren
 static ULONG_PTR g_hit_bp_hits = 0;      // its hit count when it fired
 static bool g_cond_failed = false;       // condition eval errored on the last hit
 static bool g_hit_bp_oneshot = false;    // the hit came from a temporary (start) breakpoint
+
+// GDB `commands ... end`: reading a breakpoint command list. Lines accumulate
+// in g_cmds_lines until a line "end" attaches them to breakpoint g_cmds_bpid.
+static bool g_cmds_pending = false;
+static int g_cmds_bpid = 0;
+static std::vector<std::string> g_cmds_lines;
 
 // internal source-step breakpoint (GDB `step`/`next`): a one-shot INT3 placed at the
 // end of the current source line. Kept out of g_bps so it is invisible to the user.
@@ -299,6 +307,9 @@ static bool sym_lookup(const std::string& name, ULONG_PTR& out);
 static bool eval_cond(const std::string& expr, bool& out);
 static void apply_pending_bps();
 static bool src_line(ULONG_PTR addr, std::string& file, long& line);
+struct CmdResult;
+static CmdResult execute(const std::string& line);
+static void print_result(const CmdResult& r);
 struct ScopeVar;
 static bool local_lookup(const std::string& name, const CONTEXT& c, bool is64,
                          unsigned long long& val, ULONG_PTR& addr, DWORD& size);
@@ -743,6 +754,7 @@ static void reset_state()
     g_running = false;
     g_hit_bp_id = 0; g_hit_bp_hits = 0; g_cond_failed = false;
     g_hit_bp_oneshot = false;
+    g_cmds_pending = false; g_cmds_bpid = 0; g_cmds_lines.clear();
     g_step_bp_addr = 0; g_step_tid = 0;
     g_ctx_tid = 0; g_ctx_valid = false;
     std::lock_guard<std::mutex> lk2(g_ev_mu);
@@ -963,15 +975,42 @@ static std::string stop_banner(const std::string& reason)
     return o.str();
 }
 
+static void run_bp_commands(int id);
+
 static void emit_stop(const std::string& reason)
 {
     sym_sync();   // pick up any DLLs loaded during execution so bt/resolve sees symbols
+    // GDB `commands` / `silent`: a hit breakpoint with a command list runs its
+    // commands automatically; a leading `silent` suppresses the stop banner.
+    bool bp_silent = false;
+    int cmd_bp = 0;
+    if (reason == "breakpoint" && g_hit_bp_id) {
+        std::lock_guard<std::mutex> lk(g_bp_mu);
+        auto it = g_bps.find(g_hit_bp_id);
+        if (it != g_bps.end()) {
+            cmd_bp = it->second.cmds.empty() ? 0 : g_hit_bp_id;
+            bp_silent = it->second.silent;
+        }
+    }
     if (g_silent) return;
-    std::string out = g_json ? stop_json(reason) : stop_banner(reason);
-    printf("%s\n", out.c_str());
-    fflush(stdout);
+    if (!bp_silent) {
+        std::string out = g_json ? stop_json(reason) : stop_banner(reason);
+        printf("%s\n", out.c_str());
+        fflush(stdout);
+    }
+    if (cmd_bp) run_bp_commands(cmd_bp);
     g_cond_failed = false;
     g_hit_bp_oneshot = false;
+}
+
+// GDB `commands` with no argument applies to the most recently set breakpoint;
+// ids increase monotonically so the highest surviving id is the last set.
+static int bp_last_id()
+{
+    std::lock_guard<std::mutex> lk(g_bp_mu);
+    int id = 0;
+    for (auto& kv : g_bps) if (kv.first > id) id = kv.first;
+    return id;
 }
 
 // ------------------------------------------------------------------ memory ---
@@ -2016,6 +2055,34 @@ static void page_out(const std::string& text)
         if (!std::getline(std::cin, resp)) break;
         for (auto& c : resp) c = (char)tolower((unsigned char)c);
         if (resp.find('q') != std::string::npos) break;
+    }
+}
+
+// run the GDB `commands` attached to breakpoint `id`. The target is stopped
+// (debug-event thread blocked in pause_until_continue). A command that resumes
+// execution (continue/step/next/finish) re-enters wait_stop_consume -> the next
+// stop's emit_stop, mirroring GDB's chained command lists; commands after the
+// resuming one are ignored (GDB rule).
+static void run_bp_commands(int id)
+{
+    std::vector<std::string> cmds;
+    {
+        std::lock_guard<std::mutex> lk(g_bp_mu);
+        auto it = g_bps.find(id);
+        if (it == g_bps.end()) return;
+        cmds = it->second.cmds;
+    }
+    for (size_t i = 0; i < cmds.size(); i++) {
+        std::string c = cmds[i];
+        std::string low = c;
+        std::transform(low.begin(), low.end(), low.begin(), ::tolower);
+        if (i == 0 && low == "silent") continue;   // silent is only special first
+        CmdResult r = execute(c);
+        print_result(r);
+        if (low == "continue" || low == "c" || low == "cont" ||
+            low == "step" || low == "s" || low == "next" || low == "n" ||
+            low == "stepi" || low == "si" || low == "nexti" || low == "ni" ||
+            low == "finish" || low == "fin") break;   // resuming command: stop here
     }
 }
 
@@ -4013,6 +4080,9 @@ static const char* HELP =
 "  watch / rwatch / awatch     write / read / access watchpoint on an address or symbol\n"
 "  condition <id> [expr]       set a stop condition (empty expr clears it)\n"
 "  ignore <id> <count>         ignore the next <count> hits of a breakpoint\n"
+"  commands [<id>]             attach a command list to a breakpoint (run\n"
+"                              automatically on each hit; lines until `end`,\n"
+"                              leading `silent` suppresses the stop banner)\n"
 "  info break / modules / threads / proc / events / regs\n"
 "  info locals / info args     show local variables / function parameters (PDB)\n"
 "  info files / target         info files = symbol/exec files; target = modules\n"
@@ -4055,6 +4125,28 @@ static CmdResult execute(const std::string& line)
     std::string trimmed = line;
     while (!trimmed.empty() && (trimmed.front()==' '||trimmed.front()=='\t')) trimmed.erase(trimmed.begin());
     while (!trimmed.empty() && (trimmed.back()==' '||trimmed.back()=='\t'||trimmed.back()=='\r')) trimmed.pop_back();
+
+    // inside `commands ... end`: accumulate lines until a bare `end` attaches
+    // them to the target breakpoint (GDB reads the list verbatim, no echo)
+    if (g_cmds_pending) {
+        if (trimmed == "end") {
+            g_cmds_pending = false;
+            Bpx* b = nullptr;
+            {
+                std::lock_guard<std::mutex> lk(g_bp_mu);
+                auto it = g_bps.find(g_cmds_bpid);
+                if (it != g_bps.end()) b = &it->second;
+            }
+            if (!b) return {false, "no breakpoint " + std::to_string(g_cmds_bpid)};
+            b->cmds = g_cmds_lines;
+            b->silent = !g_cmds_lines.empty() && g_cmds_lines[0] == "silent";
+            g_cmds_lines.clear();
+            return {};
+        }
+        g_cmds_lines.push_back(trimmed);
+        return {};
+    }
+
     if (trimmed.empty() || trimmed[0] == '#') return {};
     auto tok = tokenize(trimmed);
     if (tok.empty()) return {};
@@ -4065,6 +4157,21 @@ static CmdResult execute(const std::string& line)
     std::string raw_args;
     size_t sp = trimmed.find(' ');
     if (sp != std::string::npos) raw_args = trimmed.substr(sp + 1);
+
+    if (cmd == "commands") {
+        // GDB `commands [bnum]`: attach a command list to a breakpoint. The
+        // following lines are accumulated until `end` (handled above).
+        int id = tok.size() > 1 ? atoi(tok[1].c_str()) : bp_last_id();
+        if (id <= 0) return {false, "no breakpoint to attach commands to"};
+        {
+            std::lock_guard<std::mutex> lk(g_bp_mu);
+            if (!g_bps.count(id)) return {false, "no breakpoint " + std::to_string(id)};
+        }
+        g_cmds_bpid = id;
+        g_cmds_lines.clear();
+        g_cmds_pending = true;
+        return {};
+    }
 
     if (cmd == "quit" || cmd == "q" || cmd == "exit") {
         // GDB: quit ends command processing; the caller breaks out of its loop

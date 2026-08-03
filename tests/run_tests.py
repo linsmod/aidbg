@@ -502,6 +502,44 @@ def case_addr_expr():
     return results
 
 
+def case_bp_commands():
+    """Case 4.32 - GDB breakpoint command lists (commands/silent/end).
+
+    The command list attached to `break show` runs automatically on the hit:
+    `silent` suppresses the stop banner (so `start`'s temporary breakpoint is
+    the only "Stopped: breakpoint" in the output), `x/hs pw` prints the string
+    the pointer param points to, and the embedded `continue` resumes execution.
+    """
+    results = []
+    script = os.path.join(HERE, "_case_4_32_cmds.txt")
+    lines = [
+        "file test_string.exe",
+        "start",
+        "break show",
+        "commands",
+        "silent",
+        "x/hs pw",
+        "continue",
+        "end",
+        "continue",
+        "quit",
+    ]
+    with open(script, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    try:
+        rc, out = aidbg_run(script)
+    finally:
+        if os.path.exists(script):
+            os.unlink(script)
+    results.append(("breakpoint command list ran automatically",
+                    '"Hello, wide aidbg!"' in out, out))
+    results.append(("silent suppressed the show stop banner",
+                    out.count("Stopped: breakpoint") == 1, out))
+    results.append(("embedded continue resumed execution to exit",
+                    "Process exited with code 1" in out, out))
+    return results
+
+
 def case_batch_compat():
     """Case 4.22 - GDB invocation compatibility (gdb_quick_reference.txt OPTIONS).
 
@@ -790,6 +828,13 @@ CASES = [
         "expect": ["\"Hello, aidbg!\"", "\"Hello, wide aidbg!\"",
                    "48 00 65 00 6c 00", ": \"H\""],
     },
+    {
+        "id": "4.32",
+        "name": "breakpoint command lists (commands/silent/end)",
+        "script": None,
+        "expect": None,
+        "dynamic": "bpcmds",
+    },
 ]
 
 
@@ -841,6 +886,8 @@ def main():
             results = case_batch_compat()
         elif case.get("dynamic") == "addrexpr":
             results = case_addr_expr()
+        elif case.get("dynamic") == "bpcmds":
+            results = case_bp_commands()
         else:
             results = run_case(case)
         all_cases.append((case["id"], case["name"], results, case.get("xfail")))
